@@ -1,0 +1,5203 @@
+// ============================================================
+// Código completo de AppTV.tsx
+// (con canales remotos, sincronización, layout TV escalado,
+//  limpieza de textos, progreso de episodios, siguiente episodio
+//  con cuenta regresiva de 10 segundos en el reproductor,
+//  badges de estado en el header,
+//  selector de reproductor NATIVO / WEBVIEW,
+//  fuente GAMBETA PROXY,
+//  y visualización del ID del dispositivo en Ajustes y activación)
+// ============================================================
+
+import React, { useState, useEffect, useRef, useCallback, memo } from 'react';
+import {
+  StyleSheet,
+  Text,
+  View,
+  ActivityIndicator,
+  TextInput,
+  StatusBar,
+  FlatList,
+  TouchableOpacity,
+  Image,
+  Platform,
+  RefreshControl,
+  Modal,
+  Alert,
+  Animated,
+  Easing,
+  Linking,
+  TVEventHandler,
+  Dimensions,
+} from 'react-native';
+import { WebView } from 'react-native-webview';
+import { useVideoPlayer, VideoView } from 'expo-video';
+import { useEvent } from 'expo';
+import { useKeepAwake } from 'expo-keep-awake';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Ionicons } from '@expo/vector-icons';
+import * as ScreenOrientation from 'expo-screen-orientation';
+import { LinearGradient } from 'expo-linear-gradient';
+import * as Haptics from 'expo-haptics';
+import * as Device from 'expo-device';
+import Constants from 'expo-constants';
+import { XMLParser } from 'fast-xml-parser';
+
+// ============================================================
+// CONFIGURACIÓN
+// ============================================================
+const { width: W, height: H } = Dimensions.get('window');
+
+// Forzamos SIEMPRE la estructura de layout tipo TV (paneles laterales,
+// distribución, grillas grandes, etc.), sin importar el dispositivo.
+const isTV = true;
+const isMobile = false;
+
+// --- Escalado responsivo ---
+const BASE_WIDTH = 1280;
+const MIN_SCALE = 0.55;
+const rawScale = W / BASE_WIDTH;
+const SCALE = Math.max(MIN_SCALE, Math.min(1, rawScale));
+
+function rs(size: number): number {
+  return Math.round(size * SCALE);
+}
+
+function getGridColumns(): number {
+  if (W < 480) return 2;
+  if (W < 800) return 3;
+  if (W < 1100) return 4;
+  return 6;
+}
+
+function getGridItemWidth(): string {
+  const cols = getGridColumns();
+  const gapPercent = 2;
+  const width = (100 - gapPercent * (cols - 1)) / cols;
+  return `${width}%`;
+}
+
+const PLEX_BASE_URL = 'https://plex.naphdev.dpdns.org';
+const PLEX_TOKEN = 'VatLRJ2ArQnxu2d1F8ni';
+const M3U_URL = '';
+const RESOLVER_URL = 'https://resolver1.naphdev.dpdns.org';
+const API_BASE_URL = 'https://activate.naphdev.dpdns.org/api';
+const PAYMENT_URL = 'https://tu-enlace-de-pago.com';
+
+// ============================================================
+// CONFIGURACIÓN DEL PARSER XML
+// ============================================================
+const xmlParser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: '',
+  parseTagValue: true,
+  parseAttributeValue: false,
+  trimValues: true,
+  isArray: (name: string, jpath: string) => {
+    return ['MediaContainer', 'Directory', 'Video', 'Location', 'Media', 'Part', 'Stream'].includes(name);
+  },
+});
+
+const ensureArray = (value: any): any[] => {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'object') {
+    const keys = Object.keys(value);
+    if (keys.every(k => !isNaN(Number(k)))) {
+      return keys.map(k => value[k]);
+    }
+    return [value];
+  }
+  return [];
+};
+
+// ============================================================
+// UTILIDAD DE LIMPIEZA DE TEXTO
+// ============================================================
+function cleanText(text: string | null | undefined): string {
+  if (!text) return '';
+  let cleaned = text;
+  cleaned = cleaned.replace(/&amp;/g, '&')
+                   .replace(/&lt;/g, '<')
+                   .replace(/&gt;/g, '>')
+                   .replace(/&quot;/g, '"')
+                   .replace(/&#039;/g, "'")
+                   .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(parseInt(dec, 10)));
+  cleaned = cleaned.replace(/[\x00-\x1F\x7F]/g, '');
+  return cleaned.trim();
+}
+
+// ============================================================
+// TIPOS
+// ============================================================
+interface Canal {
+  id: string;
+  numero: number;
+  name: string;
+  url: string;
+  logo: string;
+  category: string;
+  nowPlaying?: string;
+  embedSlug?: string;
+  sources?: string[];
+  slug?: string;
+  isRemote?: boolean;
+}
+
+// Información de una pista de audio o subtítulo embebida en el archivo de Plex
+interface PlexStreamInfo {
+  id: string;
+  index: number;
+  streamType: number; // 2 = audio, 3 = subtítulo
+  codec?: string;
+  language?: string;
+  languageCode?: string;
+  title?: string;
+  isDefault?: boolean;
+  channels?: number;
+  forced?: boolean;
+}
+
+interface MediaItem {
+  id: string;
+  title: string;
+  poster: string;
+  backdrop?: string;
+  year?: number;
+  rating?: string;
+  overview?: string;
+  type?: 'movie' | 'tv';
+  streamUrl?: string;
+  driveFileId?: string;
+  genreIds?: number[];
+  audioStreams?: PlexStreamInfo[];
+  subtitleStreams?: PlexStreamInfo[];
+  container?: string;
+}
+
+interface PlexShow {
+  id: string;
+  title: string;
+  poster: string;
+  backdrop?: string;
+  year?: number;
+  rating?: string;
+  overview?: string;
+  seasons: PlexSeason[];
+  genreIds?: number[];
+}
+
+interface PlexSeason {
+  number: number;
+  label: string;
+  episodes: PlexEpisode[];
+}
+
+interface PlexEpisode {
+  id: string;
+  code: string;
+  title: string;
+  streamUrl: string;
+  driveFileId: string;
+  fileName: string;
+  poster?: string;
+  overview?: string;
+  airDate?: string;
+  runtime?: number;
+  audioStreams?: PlexStreamInfo[];
+  subtitleStreams?: PlexStreamInfo[];
+  container?: string;
+}
+
+interface ContinueWatchingItem {
+  id: string;
+  title: string;
+  poster: string;
+  progress: number;
+  duration: number;
+  type: 'movie' | 'episode';
+  streamUrl: string;
+  showId?: string;
+  showName?: string;
+  episodeCode?: string;
+  profileId?: string;
+  watchedAt?: number;
+  audioStreams?: PlexStreamInfo[];
+  subtitleStreams?: PlexStreamInfo[];
+}
+
+interface Profile {
+  id: string;
+  name: string;
+  avatar: string;
+  isActive?: boolean;
+}
+
+// ============================================================
+// UTILIDADES
+// ============================================================
+function extractEmbedSlug(url: string): string | null {
+  const m1 = url.match(/[?&]stream=([^&]+)/i);
+  if (m1) return m1[1];
+  const m2 = url.match(/[?&]canal=([^&]+)/i);
+  if (m2) return m2[1];
+  return null;
+}
+
+function convertirMpdAHls(url: string): string {
+  const regex = /^(https?:\/\/router\.cdn\.rcs\.net\.ar\/mnp\/([^/]+))\/output\.mpd$/i;
+  const m = url.match(regex);
+  if (m) return `${m[1]}_hls/playlist.m3u8`;
+  return url;
+}
+
+async function lockLandscape() {
+  try {
+    await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE);
+  } catch (e) {
+    console.log('[ORIENTATION] lockLandscape ERROR', e);
+  }
+}
+
+function buildChildrenUrl(key: string): string {
+  if (!key) return '';
+  return key.includes('/children') ? `${PLEX_BASE_URL}${key}` : `${PLEX_BASE_URL}${key}/children`;
+}
+
+// Extrae las pistas de audio y subtítulos embebidas en un Part de Plex
+function extractStreamsFromPart(part: any): { audioStreams: PlexStreamInfo[]; subtitleStreams: PlexStreamInfo[] } {
+  const partAttrs = part.$ || part;
+  const streamArr = ensureArray(partAttrs.Stream);
+  const audioStreams: PlexStreamInfo[] = [];
+  const subtitleStreams: PlexStreamInfo[] = [];
+
+  streamArr.forEach((s: any) => {
+    const attrs = s.$ || s;
+    const streamType = parseInt(attrs.streamType, 10);
+    if (streamType !== 2 && streamType !== 3) return;
+
+    const info: PlexStreamInfo = {
+      id: String(attrs.id || ''),
+      index: parseInt(attrs.index, 10) || 0,
+      streamType,
+      codec: attrs.codec || undefined,
+      language: cleanText(attrs.language) || undefined,
+      languageCode: attrs.languageCode || attrs.languageTag || undefined,
+      title: cleanText(attrs.extendedDisplayTitle) || cleanText(attrs.title) || undefined,
+      isDefault: attrs.default === '1' || attrs.default === 'true' || attrs.default === true,
+      channels: attrs.channels ? parseInt(attrs.channels, 10) : undefined,
+      forced: attrs.forced === '1' || attrs.forced === 'true' || attrs.forced === true,
+    };
+
+    if (streamType === 2) audioStreams.push(info);
+    else subtitleStreams.push(info);
+  });
+
+  // Orden estable: la pista marcada como "default" primero
+  audioStreams.sort((a, b) => (b.isDefault ? 1 : 0) - (a.isDefault ? 1 : 0));
+  subtitleStreams.sort((a, b) => (b.isDefault ? 1 : 0) - (a.isDefault ? 1 : 0));
+
+  return { audioStreams, subtitleStreams };
+}
+
+// Devuelve la URL de reproducción DIRECTA (Direct Play, sin transcodificar)
+// del archivo original en Plex, junto con la info de sus pistas de audio/subtítulos.
+function getPartStreamInfo(video: any): { streamUrl: string; audioStreams: PlexStreamInfo[]; subtitleStreams: PlexStreamInfo[]; container?: string } {
+  const mediaArr = ensureArray(video.Media);
+  const mediaSorted = [...mediaArr].sort((a, b) => {
+    const aAttrs = a.$ || a;
+    const bAttrs = b.$ || b;
+    return (parseInt(bAttrs.bitrate, 10) || 0) - (parseInt(aAttrs.bitrate, 10) || 0);
+  });
+  const media = mediaSorted[0];
+  if (!media) return { streamUrl: '', audioStreams: [], subtitleStreams: [] };
+  const mediaAttrs = media.$ || media;
+  const partArr = ensureArray(mediaAttrs.Part);
+  const part = partArr[0];
+  if (!part) return { streamUrl: '', audioStreams: [], subtitleStreams: [] };
+  const partAttrs = part.$ || part;
+  const partKey = partAttrs.key || '';
+  if (!partKey) return { streamUrl: '', audioStreams: [], subtitleStreams: [] };
+
+  const streamUrl = `${PLEX_BASE_URL}${partKey}?X-Plex-Token=${PLEX_TOKEN}`;
+  const { audioStreams, subtitleStreams } = extractStreamsFromPart(part);
+  return { streamUrl, audioStreams, subtitleStreams, container: mediaAttrs.container };
+}
+
+// Se mantiene por compatibilidad donde solo se necesita la URL
+function getPartStreamUrl(video: any): string {
+  return getPartStreamInfo(video).streamUrl;
+}
+
+// ============================================================
+// FUNCIONES DE PERFIL Y ALMACENAMIENTO
+// ============================================================
+const PROFILES_KEY = '@nexus_profiles';
+const CURRENT_PROFILE_KEY = '@nexus_current_profile';
+const REVOKED_KEY = '@nexus_revoked';
+const CANALES_CACHE_KEY = '@nexus_canales_cache';
+
+async function getProfiles(): Promise<Profile[]> {
+  try {
+    const raw = await AsyncStorage.getItem(PROFILES_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveProfiles(profiles: Profile[]) {
+  await AsyncStorage.setItem(PROFILES_KEY, JSON.stringify(profiles));
+}
+
+async function getCurrentProfileId(): Promise<string | null> {
+  try {
+    const id = await AsyncStorage.getItem(CURRENT_PROFILE_KEY);
+    return id;
+  } catch {
+    return null;
+  }
+}
+
+async function setCurrentProfileId(id: string) {
+  await AsyncStorage.setItem(CURRENT_PROFILE_KEY, id);
+}
+
+async function getContinueWatching(profileId?: string): Promise<ContinueWatchingItem[]> {
+  const pid = profileId || (await getCurrentProfileId()) || 'default';
+  const raw = await AsyncStorage.getItem(`continueWatching_${pid}`);
+  return raw ? JSON.parse(raw) : [];
+}
+
+async function saveContinueWatching(item: ContinueWatchingItem, profileId?: string) {
+  try {
+    const pid = profileId || (await getCurrentProfileId()) || 'default';
+    const raw = await AsyncStorage.getItem(`continueWatching_${pid}`);
+    const list: ContinueWatchingItem[] = raw ? JSON.parse(raw) : [];
+    const existingIndex = list.findIndex(i => i.id === item.id);
+    if (existingIndex >= 0) {
+      list[existingIndex] = { ...list[existingIndex], ...item };
+    } else {
+      list.push(item);
+    }
+    const sorted = list.sort((a, b) => (b.watchedAt || 0) - (a.watchedAt || 0));
+    await AsyncStorage.setItem(`continueWatching_${pid}`, JSON.stringify(sorted));
+  } catch (e) {
+    console.log('[SAVE] Error guardando continuar viendo', e);
+  }
+}
+
+async function getFavorites(profileId?: string): Promise<string[]> {
+  const pid = profileId || (await getCurrentProfileId()) || 'default';
+  const raw = await AsyncStorage.getItem(`favorites_${pid}`);
+  return raw ? JSON.parse(raw) : [];
+}
+
+async function saveFavorites(favorites: string[], profileId?: string) {
+  const pid = profileId || (await getCurrentProfileId()) || 'default';
+  await AsyncStorage.setItem(`favorites_${pid}`, JSON.stringify(favorites));
+}
+
+// ============================================================
+// FUNCIONES PLEX
+// ============================================================
+const cargarPeliculasPlex = async (): Promise<MediaItem[]> => {
+  console.log('[PLEX] Iniciando carga de películas...');
+  try {
+    const sectionsRes = await fetch(`${PLEX_BASE_URL}/library/sections?X-Plex-Token=${PLEX_TOKEN}`);
+    const sectionsText = await sectionsRes.text();
+    const sectionsParsed = xmlParser.parse(sectionsText);
+    const containers = ensureArray(sectionsParsed.MediaContainer);
+    let movieSectionKey = '1';
+    for (const container of containers) {
+      const dirs = ensureArray(container.Directory);
+      for (const dir of dirs) {
+        const attrs = dir.$ || dir;
+        if (attrs.type === 'movie') {
+          movieSectionKey = attrs.key;
+          break;
+        }
+      }
+      if (movieSectionKey !== '1') break;
+    }
+    const moviesRes = await fetch(`${PLEX_BASE_URL}/library/sections/${movieSectionKey}/all?X-Plex-Token=${PLEX_TOKEN}`);
+    const moviesText = await moviesRes.text();
+    const moviesParsed = xmlParser.parse(moviesText);
+    const movieContainers = ensureArray(moviesParsed.MediaContainer);
+    let videos: any[] = [];
+    for (const mc of movieContainers) {
+      videos = videos.concat(ensureArray(mc.Video));
+    }
+    const items: MediaItem[] = videos.map((v: any) => {
+      const attrs = v.$ || v;
+      const { streamUrl, audioStreams, subtitleStreams, container } = getPartStreamInfo(v);
+      if (!streamUrl) {
+        console.warn(`[PLEX] "${attrs.title}" no tiene Media/Part.key, no se podrá reproducir`);
+      } else {
+        console.log(`[PLEX] streamUrl (Direct Play) para "${attrs.title}": ${streamUrl}`);
+        console.log(`[PLEX] "${attrs.title}" -> ${audioStreams.length} pistas de audio, ${subtitleStreams.length} subtítulos`);
+      }
+      return {
+        id: attrs.ratingKey || '',
+        title: cleanText(attrs.title) || 'Sin título',
+        poster: `${PLEX_BASE_URL}${attrs.thumb || ''}?X-Plex-Token=${PLEX_TOKEN}`,
+        backdrop: attrs.art ? `${PLEX_BASE_URL}${attrs.art}?X-Plex-Token=${PLEX_TOKEN}` : undefined,
+        year: parseInt(attrs.year, 10) || undefined,
+        rating: attrs.rating || '0.0',
+        overview: cleanText(attrs.summary) || 'Sin descripción.',
+        type: 'movie',
+        streamUrl,
+        driveFileId: '',
+        genreIds: [],
+        audioStreams,
+        subtitleStreams,
+        container,
+      };
+    });
+    console.log(`[PLEX] ${items.length} películas cargadas`);
+    return items;
+  } catch (e) {
+    console.error('[PLEX] Error cargando películas', e);
+    return [];
+  }
+};
+
+const cargarSeriesPlexLocal = async (sectionNameFilter?: string | RegExp): Promise<PlexShow[]> => {
+  console.log('[PLEX] Iniciando carga de series con filtro:', sectionNameFilter || 'todas');
+  try {
+    const sectionsRes = await fetch(`${PLEX_BASE_URL}/library/sections?X-Plex-Token=${PLEX_TOKEN}`);
+    const sectionsText = await sectionsRes.text();
+    const sectionsParsed = xmlParser.parse(sectionsText);
+    const containers = ensureArray(sectionsParsed.MediaContainer);
+    let allShows: PlexShow[] = [];
+    for (const container of containers) {
+      const dirs = ensureArray(container.Directory);
+      for (const dir of dirs) {
+        const attrs = dir.$ || dir;
+        if (attrs.type === 'show') {
+          const sectionTitle = attrs.title || 'Sin nombre';
+          if (sectionNameFilter) {
+            if (typeof sectionNameFilter === 'string') {
+              if (!sectionTitle.toLowerCase().includes(sectionNameFilter.toLowerCase())) {
+                continue;
+              }
+            } else if (sectionNameFilter instanceof RegExp) {
+              if (!sectionNameFilter.test(sectionTitle)) {
+                continue;
+              }
+            }
+          }
+          const showSectionKey = attrs.key;
+          console.log(`[PLEX] Procesando sección: ${sectionTitle} (key: ${showSectionKey})`);
+          const showsRes = await fetch(`${PLEX_BASE_URL}/library/sections/${showSectionKey}/all?X-Plex-Token=${PLEX_TOKEN}`);
+          const showsText = await showsRes.text();
+          const showsParsed = xmlParser.parse(showsText);
+          const showContainers = ensureArray(showsParsed.MediaContainer);
+          let showsData: any[] = [];
+          for (const mc of showContainers) {
+            showsData = showsData.concat(ensureArray(mc.Directory));
+          }
+          console.log(`[PLEX] ${showsData.length} series encontradas en ${sectionTitle}`);
+          for (const show of showsData) {
+            const showAttrs = show.$ || show;
+            const showKey = showAttrs.key;
+            if (!showKey) continue;
+            const seasonsUrl = buildChildrenUrl(showKey);
+            console.log(`[PLEX] URL temporadas para "${showAttrs.title}": ${seasonsUrl}`);
+            const seasonsRes = await fetch(`${seasonsUrl}?X-Plex-Token=${PLEX_TOKEN}`);
+            const seasonsText = await seasonsRes.text();
+            const seasonsParsed = xmlParser.parse(seasonsText);
+            const seasonContainers = ensureArray(seasonsParsed.MediaContainer);
+            let seasonsData: any[] = [];
+            for (const mc of seasonContainers) {
+              seasonsData = seasonsData.concat(ensureArray(mc.Directory));
+            }
+            console.log(`[PLEX] ${seasonsData.length} temporadas encontradas para ${showAttrs.title}`);
+            const seasons: PlexSeason[] = [];
+            for (const season of seasonsData) {
+              const seasonAttrs = season.$ || season;
+              const seasonKey = seasonAttrs.key;
+              const seasonNumber = parseInt(seasonAttrs.index, 10) || 0;
+              if (!seasonKey) continue;
+              const episodesUrl = buildChildrenUrl(seasonKey);
+              console.log(`[PLEX] URL episodios temporada ${seasonNumber}: ${episodesUrl}`);
+              const epsRes = await fetch(`${episodesUrl}?X-Plex-Token=${PLEX_TOKEN}`);
+              const epsText = await epsRes.text();
+              const epsParsed = xmlParser.parse(epsText);
+              const epsContainers = ensureArray(epsParsed.MediaContainer);
+              let epsData: any[] = [];
+              for (const mc of epsContainers) {
+                epsData = epsData.concat(ensureArray(mc.Video));
+              }
+              console.log(`[PLEX] ${epsData.length} episodios encontrados en temporada ${seasonNumber}`);
+              const episodes: PlexEpisode[] = epsData.map((ep: any) => {
+                const epAttrs = ep.$ || ep;
+                const epNumber = parseInt(epAttrs.index, 10) || 0;
+                const seasonNum = parseInt(epAttrs.parentIndex, 10) || seasonNumber;
+                const ratingKey = epAttrs.ratingKey;
+                if (!ratingKey) {
+                  console.warn('[PLEX] Episodio sin ratingKey:', epAttrs);
+                }
+                const { streamUrl, audioStreams, subtitleStreams, container } = getPartStreamInfo(ep);
+                if (!streamUrl) {
+                  console.warn(`[PLEX] Episodio "${epAttrs.title}" sin Media/Part.key, no se podrá reproducir`);
+                }
+                return {
+                  id: ratingKey || '',
+                  code: `S${String(seasonNum).padStart(2, '0')}E${String(epNumber).padStart(2, '0')}`,
+                  title: cleanText(epAttrs.title) || `Episodio ${epNumber}`,
+                  streamUrl,
+                  driveFileId: '',
+                  fileName: '',
+                  poster: epAttrs.thumb ? `${PLEX_BASE_URL}${epAttrs.thumb}?X-Plex-Token=${PLEX_TOKEN}` : undefined,
+                  overview: cleanText(epAttrs.summary) || '',
+                  audioStreams,
+                  subtitleStreams,
+                  container,
+                };
+              });
+              seasons.push({
+                number: seasonNumber,
+                label: cleanText(seasonAttrs.title) || `Temporada ${seasonNumber}`,
+                episodes: episodes.sort((a, b) => parseInt(a.code.split('E')[1], 10) - parseInt(b.code.split('E')[1], 10)),
+              });
+            }
+            allShows.push({
+              id: showAttrs.ratingKey || '',
+              title: cleanText(showAttrs.title) || 'Sin título',
+              poster: `${PLEX_BASE_URL}${showAttrs.thumb || ''}?X-Plex-Token=${PLEX_TOKEN}`,
+              backdrop: showAttrs.art ? `${PLEX_BASE_URL}${showAttrs.art}?X-Plex-Token=${PLEX_TOKEN}` : undefined,
+              year: parseInt(showAttrs.year, 10) || undefined,
+              rating: showAttrs.rating || '0.0',
+              overview: cleanText(showAttrs.summary) || 'Sin descripción.',
+              seasons: seasons.sort((a, b) => a.number - b.number),
+              genreIds: [],
+            });
+          }
+        }
+      }
+    }
+    console.log(`[PLEX] Total: ${allShows.length} series cargadas con filtro ${sectionNameFilter || 'todas'}`);
+    return allShows;
+  } catch (e) {
+    console.error('[PLEX] Error cargando series', e);
+    return [];
+  }
+};
+
+// ============================================================
+// CANALES MANUALES (fallback)
+// ============================================================
+const CANALES_MANUALES: Canal[] = [
+];
+
+// ============================================================
+// MAPEO DE SLUGS (para fallback)
+// ============================================================
+const SLUG_MAP: Record<string, string> = {
+  'dsports': 'directv-sports',
+  'dsports2': 'directv-sports-2',
+  'dsportsplus': 'directv-sports-plus',
+  'tycsports': 'tyc-sports',
+  'tntsports': 'tnt-sports',
+  'espnpremium': 'espn-premium',
+  'espn': 'espn-1',
+  'espn2': 'espn-2',
+  'espn3': 'espn-3',
+  'espn4': 'espn-4',
+  'espn5': 'espn-5',
+  'espn6': 'espn-6',
+  'telefe': 'telefe',
+  'tntseries': 'tnt-series',
+  'disneychannel': 'disney-channel',
+  'tnt': 'tnt',
+  'warnerchannel': 'warner-channel',
+  'fx': 'fx',
+  'comedycentral': 'comedy-central',
+  'golden': 'golden',
+  'goldenedge': 'golden-edge',
+  'discoveryscience': 'discovery-science',
+  'universalpremiere': 'universal-premiere',
+  'animalplanet': 'animal-planet',
+  'discoveryturbo': 'discovery-turbo',
+  'tntnovelas': 'tnt-novelas',
+};
+
+// ============================================================
+// FUENTES PARA GAMBETA PROXY
+// ============================================================
+function getSourceOptionsForSlug(embedSlug: string, category?: string): { label: string; url: string }[] {
+  const slug = SLUG_MAP[embedSlug] || embedSlug;
+  const options: { label: string; url: string }[] = [];
+  if (embedSlug) {
+    if (!category || !category.toLowerCase().includes('entretenimiento')) {
+      options.push({ label: 'SigNex', url: `https://streamhdx.com/live1.php?stream=${embedSlug}` });
+    }
+    options.push({ label: 'SigNex2', url: `https://gambeta.vip/canal/${slug}` });
+    options.push({ label: 'SigNex3', url: `https://streamtp99a.sbs/global1.php?stream=${embedSlug}` });
+    options.push({ label: 'SigNex4', url: `https://regionales.saohgdasregions.fun/stream.php?canal=${embedSlug}` });
+    options.push({ label: 'SigNex5', url: `https://tvlibreonline.tv/en-vivo/${slug}` });
+    // NUEVO: Gambeta Proxy (scraping en servidor)
+    options.push({ label: 'Gambeta Proxy', url: `${API_BASE_URL}/get_gambeta_stream.php?slug=${slug}` });
+    // NUEVO: Cablevision HD (wrappers)
+    options.push({ label: 'Cablevision HD 1', url: `https://www.cablevisionhd.com/stream/core.php?canal=${embedSlug}` });
+    options.push({ label: 'Cablevision HD 2', url: `https://www.cablevisionhd.com/stream2/core.php?canal=${embedSlug}` });
+    options.push({ label: 'Cablevision HD 3', url: `https://www.cablevisionhd.com/stream3/core.php?canal=${embedSlug}` });
+    // NUEVO: Embed directo (se cargará en WebView)
+    options.push({ label: 'Embed (WebView)', url: `https://embed.saohgdasregions.fun/embed/${embedSlug}.php` });
+    // 🔥 NUEVO: Proxy de BixPlay (el que funciona)
+    const embedUrl = `https://embed.saohgdasregions.fun/embed/${embedSlug}.php`;
+    options.push({
+      label: 'BixPlay Proxy',
+      url: `https://server.bixplay.online/servidor_nuevo/tv/get.php?id=${encodeURIComponent(embedUrl)}&playeractivatenative=true`
+    });
+  }
+  return options;
+}
+
+// ============================================================
+// RESOLUCIÓN DE FUENTES (con soporte para IP:puerto HTTP, Gambeta Proxy,
+// iframes y extracción de manifiestos de regionales)
+// ============================================================
+async function resolveSingleSource(sourceUrl: string): Promise<string> {
+  console.log('[RESOLVE] Intentando resolver:', sourceUrl);
+
+  // 1️⃣ IP directa con puerto
+  const ipPortRegex = /^https?:\/\/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+/;
+  if (ipPortRegex.test(sourceUrl)) {
+    console.log('[RESOLVE] IP directa, pasando.');
+    return sourceUrl;
+  }
+
+  // 2️⃣ Stream directo (HLS/MPD/playlist.php)
+  if (sourceUrl.includes('.m3u8') || sourceUrl.includes('.mpd') || sourceUrl.includes('manifest') || sourceUrl.includes('playlist.php')) {
+    console.log('[RESOLVE] Stream directo, pasando.');
+    return sourceUrl;
+  }
+
+  // 3️⃣ URLs que devuelven un iframe (wrappers)
+  if (sourceUrl.includes('embed.saohgdasregions.fun/embed2/') || sourceUrl.includes('cablevisionhd.com/stream') || sourceUrl.includes('tvenvivo2.com/live')) {
+    console.log('[RESOLVE] Extrayendo stream de wrapper HTML...');
+    try {
+      const response = await fetch(sourceUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+      });
+      const html = await response.text();
+      const iframeRegex = /<iframe[^>]+src="([^"]+)"[^>]*>/gi;
+      let match;
+      let streamUrl = null;
+      while ((match = iframeRegex.exec(html)) !== null) {
+        const src = match[1];
+        if (src.includes('stream.php') || src.includes('regionales.saohgdasregions.fun') || src.includes('deportes.ksdjugfsddeports.com')) {
+          streamUrl = src;
+          break;
+        }
+      }
+      if (streamUrl) {
+        if (streamUrl.startsWith('//')) {
+          streamUrl = 'https:' + streamUrl;
+        } else if (streamUrl.startsWith('/')) {
+          const base = new URL(sourceUrl).origin;
+          streamUrl = base + streamUrl;
+        }
+        streamUrl = streamUrl.replace(/&amp;/g, '&');
+        console.log('[RESOLVE] Stream extraído del iframe:', streamUrl);
+        return streamUrl;
+      } else {
+        throw new Error('No se encontró iframe con el stream');
+      }
+    } catch (err) {
+      console.log('[RESOLVE] Error extrayendo stream del wrapper:', err);
+      throw err;
+    }
+  }
+
+  // 4️⃣ Extraer stream de embeds de saohgdasregions.fun
+  if (sourceUrl.includes('embed.saohgdasregions.fun/embed/')) {
+    console.log('[RESOLVE] Extrayendo stream del embed:', sourceUrl);
+    try {
+      const response = await fetch(sourceUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Referer': 'https://embed.saohgdasregions.fun/',
+        }
+      });
+      const html = await response.text();
+      const iframeRegex = /<iframe[^>]+src="([^"]+)"[^>]*>/gi;
+      let match;
+      let streamUrl = null;
+      while ((match = iframeRegex.exec(html)) !== null) {
+        const src = match[1];
+        if (src.includes('stream.php') || src.includes('regionales.saohgdasregions.fun') || src.includes('deportes.ksdjugfsddeports.com')) {
+          streamUrl = src;
+          break;
+        }
+      }
+      if (streamUrl) {
+        if (streamUrl.startsWith('//')) {
+          streamUrl = 'https:' + streamUrl;
+        } else if (streamUrl.startsWith('/')) {
+          const base = new URL(sourceUrl).origin;
+          streamUrl = base + streamUrl;
+        }
+        streamUrl = streamUrl.replace(/&amp;/g, '&');
+        console.log('[RESOLVE] Stream extraído del embed:', streamUrl);
+        return streamUrl;
+      } else {
+        throw new Error('No se encontró iframe con el stream en el embed');
+      }
+    } catch (err) {
+      console.log('[RESOLVE] Error extrayendo stream del embed:', err);
+      // En caso de error, devolvemos la URL original para que intente WebView como respaldo
+      return sourceUrl;
+    }
+  }
+
+  // 5️⃣ URLs de regionales (stream.php) – las tratamos como un "embed" para WebView
+  if (sourceUrl.includes('regionales.saohgdasregions.fun/stream.php') || 
+      sourceUrl.includes('deportes.ksdjugfsddeports.com/stream.php')) {
+    console.log('[RESOLVE] Es un stream.php, se usará como embed en WebView.');
+    // Devolvemos la URL original sin extraer nada
+    return sourceUrl;
+  }
+
+  // 6️⃣ Gambeta Proxy
+  if (sourceUrl.includes('/get_gambeta_stream.php')) {
+    try {
+      console.log('[RESOLVE] Llamando a Gambeta Proxy:', sourceUrl);
+      const response = await fetch(sourceUrl);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} - ${response.statusText}`);
+      }
+      const data = await response.json();
+      if (data.url) {
+        console.log('[RESOLVE] Stream de Gambeta obtenido:', data.url);
+        return data.url;
+      } else {
+        throw new Error(data.error || 'No se pudo obtener el stream de Gambeta');
+      }
+    } catch (e) {
+      console.log('[RESOLVE] Error obteniendo stream de Gambeta', e);
+      throw e;
+    }
+  }
+
+  // 7️⃣ Proxy genérico (resolver)
+  const proxyUrl = `${RESOLVER_URL}/proxy/playlist.m3u8?src=${encodeURIComponent(sourceUrl)}`;
+  console.log('[RESOLVE] Intentando resolver vía proxy:', proxyUrl);
+
+  const timeoutPromise = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error('Timeout de 10 segundos')), 10000)
+  );
+
+  const fetchPromise = fetch(proxyUrl, { method: 'HEAD' })
+    .then(response => {
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} - ${response.statusText}`);
+      }
+      return proxyUrl;
+    });
+
+  try {
+    const resolved = await Promise.race([fetchPromise, timeoutPromise]);
+    console.log('[RESOLVE] Resuelto exitosamente:', resolved);
+    return resolved;
+  } catch (err) {
+    console.log('[RESOLVE] Falló la resolución vía proxy:', err);
+    throw err;
+  }
+}
+
+// ============================================================
+// SISTEMA DE ACTIVACIÓN CON VERIFICACIÓN REMOTA
+// ============================================================
+const TRIAL_KEY = '@nexus_trial_data';
+const ACTIVATION_KEY = '@nexus_activation_data';
+
+async function getDeviceId(): Promise<string> {
+  try {
+    const id = Device.deviceId;
+    if (id) return id;
+    let fallbackId = await AsyncStorage.getItem('@nexus_device_fallback_id');
+    if (!fallbackId) {
+      fallbackId = Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
+      await AsyncStorage.setItem('@nexus_device_fallback_id', fallbackId);
+    }
+    return fallbackId;
+  } catch {
+    return 'unknown-device';
+  }
+}
+
+interface TrialData {
+  deviceId: string;
+  startDate: number;
+}
+
+interface ActivationData {
+  code: string;
+  expirationDate: number;
+}
+
+async function checkAccessStatus(): Promise<{ valid: boolean; daysLeft?: number; expired: boolean; isActivated: boolean; activationExpiration?: number }> {
+  try {
+    const revoked = await AsyncStorage.getItem(REVOKED_KEY);
+    if (revoked === 'true') {
+      return { valid: false, expired: true, isActivated: false };
+    }
+    const activationRaw = await AsyncStorage.getItem(ACTIVATION_KEY);
+    if (activationRaw) {
+      const activation: ActivationData = JSON.parse(activationRaw);
+      const now = Date.now();
+      if (now < activation.expirationDate) {
+        const daysLeft = Math.ceil((activation.expirationDate - now) / (1000 * 60 * 60 * 24));
+        return { valid: true, daysLeft, expired: false, isActivated: true, activationExpiration: activation.expirationDate };
+      } else {
+        await AsyncStorage.setItem(REVOKED_KEY, 'true');
+        return { valid: false, expired: true, isActivated: true };
+      }
+    }
+    const raw = await AsyncStorage.getItem(TRIAL_KEY);
+    if (!raw) {
+      const deviceId = await getDeviceId();
+      const data: TrialData = { deviceId, startDate: Date.now() };
+      await AsyncStorage.setItem(TRIAL_KEY, JSON.stringify(data));
+      return { valid: true, daysLeft: 3, expired: false, isActivated: false };
+    }
+    const data: TrialData = JSON.parse(raw);
+    const elapsed = Date.now() - data.startDate;
+    const days = elapsed / (1000 * 60 * 60 * 24);
+    if (days >= 3) {
+      await AsyncStorage.setItem(REVOKED_KEY, 'true');
+      return { valid: false, expired: true, isActivated: false };
+    } else {
+      const daysLeft = Math.ceil(3 - days);
+      return { valid: true, daysLeft, expired: false, isActivated: false };
+    }
+  } catch (e) {
+    console.log('[ACCESS] Error verificando acceso', e);
+    return { valid: true, expired: false, isActivated: false };
+  }
+}
+
+async function activateWithCode(code: string): Promise<{ success: boolean; expirationDate?: number; error?: string }> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/verify_code.php`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code, deviceId: await getDeviceId() }),
+    });
+    const result = await response.json();
+    if (result.success && result.expirationDate) {
+      const activation: ActivationData = {
+        code,
+        expirationDate: result.expirationDate,
+      };
+      await AsyncStorage.setItem(ACTIVATION_KEY, JSON.stringify(activation));
+      await AsyncStorage.removeItem(REVOKED_KEY);
+      return { success: true, expirationDate: result.expirationDate };
+    } else {
+      return { success: false, error: result.message || 'Código inválido' };
+    }
+  } catch (e) {
+    console.log('[ACTIVATE] Error activando', e);
+    return { success: false, error: 'Error de conexión con el servidor' };
+  }
+}
+
+async function reportTrialToServer(deviceId: string, trialStart: number) {
+  try {
+    await fetch(`${API_BASE_URL}/report_trial.php`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId, trialStart }),
+    });
+  } catch (e) {
+    console.log('[REPORT] No se pudo reportar prueba', e);
+  }
+}
+
+async function checkRemoteStatus(deviceId: string): Promise<{ status: string; expirationDate?: number }> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/check_device.php`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId }),
+    });
+    const result = await response.json();
+    if (result.success) {
+      return { status: result.status, expirationDate: result.expiration_date };
+    }
+    return { status: 'unknown' };
+  } catch (e) {
+    console.log('[REMOTE_STATUS] Error al consultar:', e);
+    return { status: 'unknown' };
+  }
+}
+
+// ============================================================
+// COMPONENTE FOCUSABLE
+// ============================================================
+const Focusable = memo(({ children, onPress, onLongPress, style, activeOpacity = 0.7, hasTVPreferredFocus = false, tvParallaxProperties, ...props }: any) => {
+  const [focused, setFocused] = useState(false);
+  const scaleAnim = useRef(new Animated.Value(1)).current;
+  const glowAnim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    Animated.spring(scaleAnim, {
+      toValue: focused ? 1.08 : 1,
+      friction: 4,
+      tension: 150,
+      useNativeDriver: true,
+    }).start();
+    Animated.timing(glowAnim, {
+      toValue: focused ? 1 : 0,
+      duration: 200,
+      useNativeDriver: false,
+    }).start();
+  }, [focused]);
+
+  const focusableStyle = [
+    style,
+    focused && stylesTV.focused,
+    { transform: [{ scale: scaleAnim }] },
+    focused && {
+      shadowColor: '#ff1744',
+      shadowOffset: { width: 0, height: 0 },
+      shadowOpacity: glowAnim.interpolate({ inputRange: [0, 1], outputRange: [0, 0.8] }),
+      shadowRadius: glowAnim.interpolate({ inputRange: [0, 1], outputRange: [0, 25] }),
+      elevation: focused ? 15 : 0,
+    },
+  ];
+
+  return (
+    <TouchableOpacity
+      {...props}
+      style={focusableStyle}
+      onPress={onPress}
+      onLongPress={onLongPress}
+      activeOpacity={activeOpacity}
+      hasTVPreferredFocus={hasTVPreferredFocus}
+      tvParallaxProperties={tvParallaxProperties || { enabled: true, shiftDistanceX: 10, shiftDistanceY: 10, tiltAngle: 0.05, magnification: 1.05 }}
+      onFocus={() => setFocused(true)}
+      onBlur={() => setFocused(false)}
+    >
+      {children}
+    </TouchableOpacity>
+  );
+});
+
+// ============================================================
+// COMPONENTE: SELECTOR DE FUENTES (MODAL)
+// ============================================================
+const SourceSelectorModal = memo(({ visible, options, selectedIndex, onSelect, onClose }: { visible: boolean; options: { label: string; url: string }[]; selectedIndex: number; onSelect: (index: number) => void; onClose: () => void }) => {
+  if (!visible) return null;
+  if (!options || options.length === 0) return null;
+
+  return (
+    <Modal transparent visible={visible} animationType="fade" onRequestClose={onClose}>
+      <TouchableOpacity style={stylesTV.sourceModalOverlay} activeOpacity={1} onPress={onClose}>
+        <View style={stylesTV.sourceModalContent}>
+          <View style={stylesTV.sourceModalHeader}>
+            <Text style={stylesTV.sourceModalTitle}>📡 Seleccionar fuente</Text>
+            <Focusable onPress={onClose}>
+              <Ionicons name="close" size={rs(36)} color="#fff" />
+            </Focusable>
+          </View>
+          {options.map((opt, idx) => (
+            <Focusable
+              key={idx}
+              style={[stylesTV.sourceOption, idx === selectedIndex && stylesTV.sourceOptionSelected]}
+              onPress={() => { onSelect(idx); onClose(); }}
+              hasTVPreferredFocus={idx === 0}
+            >
+              <Text style={[stylesTV.sourceOptionText, idx === selectedIndex && stylesTV.sourceOptionTextSelected]}>
+                {opt.label}
+              </Text>
+              {idx === selectedIndex && <Ionicons name="checkmark-circle" size={rs(28)} color="#ff1744" />}
+            </Focusable>
+          ))}
+        </View>
+      </TouchableOpacity>
+    </Modal>
+  );
+});
+
+// ============================================================
+// COMPONENTE: SELECTOR DE PISTAS DE AUDIO / SUBTÍTULOS
+// ============================================================
+const TracksSelectorModal = memo(({
+  visible,
+  onClose,
+  audioTracks,
+  subtitleTracks,
+  currentAudioTrack,
+  currentSubtitleTrack,
+  onSelectAudio,
+  onSelectSubtitle,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  audioTracks: any[];
+  subtitleTracks: any[];
+  currentAudioTrack: any;
+  currentSubtitleTrack: any;
+  onSelectAudio: (track: any) => void;
+  onSelectSubtitle: (track: any | null) => void;
+}) => {
+  const [tab, setTab] = useState<'audio' | 'subs'>('audio');
+
+  if (!visible) return null;
+
+  const trackLabel = (t: any, idx: number) => {
+    if (!t) return `Pista ${idx + 1}`;
+    return t.label || t.language || t.id || `Pista ${idx + 1}`;
+  };
+
+  const isSameTrack = (a: any, b: any) => {
+    if (!a && !b) return true;
+    if (!a || !b) return false;
+    return (a.id !== undefined && a.id === b.id) || a === b;
+  };
+
+  return (
+    <Modal transparent visible={visible} animationType="fade" onRequestClose={onClose}>
+      <TouchableOpacity style={stylesTV.sourceModalOverlay} activeOpacity={1} onPress={onClose}>
+        <View style={stylesTV.sourceModalContent}>
+          <View style={stylesTV.sourceModalHeader}>
+            <Text style={stylesTV.sourceModalTitle}>🌐 Idioma / Subtítulos</Text>
+            <Focusable onPress={onClose}>
+              <Ionicons name="close" size={rs(36)} color="#fff" />
+            </Focusable>
+          </View>
+
+          <View style={{ flexDirection: 'row', marginBottom: rs(16) }}>
+            <Focusable
+              style={[stylesTV.tracksTabBtn, tab === 'audio' && stylesTV.tracksTabBtnActive]}
+              onPress={() => setTab('audio')}
+            >
+              <Ionicons name="mic-outline" size={rs(24)} color={tab === 'audio' ? '#fff' : 'rgba(255,255,255,0.6)'} />
+              <Text style={[stylesTV.tracksTabText, tab === 'audio' && stylesTV.tracksTabTextActive]}>Audio</Text>
+            </Focusable>
+            <Focusable
+              style={[stylesTV.tracksTabBtn, tab === 'subs' && stylesTV.tracksTabBtnActive]}
+              onPress={() => setTab('subs')}
+            >
+              <Ionicons name="text-outline" size={rs(24)} color={tab === 'subs' ? '#fff' : 'rgba(255,255,255,0.6)'} />
+              <Text style={[stylesTV.tracksTabText, tab === 'subs' && stylesTV.tracksTabTextActive]}>Subtítulos</Text>
+            </Focusable>
+          </View>
+
+          {tab === 'audio' ? (
+            audioTracks.length === 0 ? (
+              <Text style={stylesTV.trialActivationLabel}>No se detectaron pistas de audio alternativas.</Text>
+            ) : (
+              audioTracks.map((t, idx) => (
+                <Focusable
+                  key={t.id ?? idx}
+                  style={[stylesTV.sourceOption, isSameTrack(t, currentAudioTrack) && stylesTV.sourceOptionSelected]}
+                  onPress={() => { onSelectAudio(t); onClose(); }}
+                  hasTVPreferredFocus={idx === 0}
+                >
+                  <Text style={[stylesTV.sourceOptionText, isSameTrack(t, currentAudioTrack) && stylesTV.sourceOptionTextSelected]}>
+                    {trackLabel(t, idx)}
+                  </Text>
+                  {isSameTrack(t, currentAudioTrack) && <Ionicons name="checkmark-circle" size={rs(28)} color="#ff1744" />}
+                </Focusable>
+              ))
+            )
+          ) : (
+            <>
+              <Focusable
+                style={[stylesTV.sourceOption, !currentSubtitleTrack && stylesTV.sourceOptionSelected]}
+                onPress={() => { onSelectSubtitle(null); onClose(); }}
+                hasTVPreferredFocus={true}
+              >
+                <Text style={[stylesTV.sourceOptionText, !currentSubtitleTrack && stylesTV.sourceOptionTextSelected]}>
+                  Desactivados
+                </Text>
+                {!currentSubtitleTrack && <Ionicons name="checkmark-circle" size={rs(28)} color="#ff1744" />}
+              </Focusable>
+              {subtitleTracks.map((t, idx) => (
+                <Focusable
+                  key={t.id ?? idx}
+                  style={[stylesTV.sourceOption, isSameTrack(t, currentSubtitleTrack) && stylesTV.sourceOptionSelected]}
+                  onPress={() => { onSelectSubtitle(t); onClose(); }}
+                >
+                  <Text style={[stylesTV.sourceOptionText, isSameTrack(t, currentSubtitleTrack) && stylesTV.sourceOptionTextSelected]}>
+                    {trackLabel(t, idx)}
+                  </Text>
+                  {isSameTrack(t, currentSubtitleTrack) && <Ionicons name="checkmark-circle" size={rs(28)} color="#ff1744" />}
+                </Focusable>
+              ))}
+            </>
+          )}
+        </View>
+      </TouchableOpacity>
+    </Modal>
+  );
+});
+
+// ============================================================
+// COMPONENTE: DIÁLOGO DE REANUDACIÓN
+// ============================================================
+const ResumeDialog = memo(({ visible, item, onResume, onRestart, onCancel }: { visible: boolean; item: ContinueWatchingItem | null; onResume: () => void; onRestart: () => void; onCancel: () => void }) => {
+  if (!visible || !item) return null;
+  const progressPercent = item.duration > 0 ? Math.min(100, (item.progress / item.duration) * 100) : 0;
+  return (
+    <Modal transparent visible={visible} animationType="fade" onRequestClose={onCancel}>
+      <TouchableOpacity style={stylesTV.resumeOverlay} activeOpacity={1} onPress={onCancel}>
+        <View style={stylesTV.resumeContent}>
+          <View style={stylesTV.resumeHeader}>
+            <Text style={stylesTV.resumeTitle}>⏳ ¿Dónde quieres comenzar?</Text>
+            <Focusable onPress={onCancel}>
+              <Ionicons name="close" size={rs(36)} color="#fff" />
+            </Focusable>
+          </View>
+          <Image source={{ uri: item.poster }} style={stylesTV.resumePoster} />
+          <Text style={stylesTV.resumeItemTitle} numberOfLines={2}>{item.title}</Text>
+          <Text style={stylesTV.resumeProgressText}>Progreso guardado: {Math.round(progressPercent)}%</Text>
+          <View style={stylesTV.resumeButtons}>
+            <Focusable style={[stylesTV.resumeBtn, stylesTV.resumeBtnPrimary]} onPress={onResume} hasTVPreferredFocus={true}>
+              <Ionicons name="play-forward" size={rs(28)} color="#fff" />
+              <Text style={stylesTV.resumeBtnText}>Continuar (desde {Math.round(progressPercent)}%)</Text>
+            </Focusable>
+            <Focusable style={[stylesTV.resumeBtn, stylesTV.resumeBtnSecondary]} onPress={onRestart}>
+              <Ionicons name="refresh" size={rs(28)} color="#fff" />
+              <Text style={stylesTV.resumeBtnText}>Desde el principio</Text>
+            </Focusable>
+          </View>
+        </View>
+      </TouchableOpacity>
+    </Modal>
+  );
+});
+
+// ============================================================
+// PANTALLA DE PERFILES
+// ============================================================
+const ProfileScreen = memo(({ profiles, onSelectProfile, onCreateProfile, onDeleteProfile }: { profiles: Profile[]; onSelectProfile: (id: string) => void; onCreateProfile: (profile: Profile) => void; onDeleteProfile: (id: string) => void }) => {
+  const [showCreate, setShowCreate] = useState(false);
+  const [newProfileName, setNewProfileName] = useState('');
+  const avatars = ['👤', '👩', '🧑', '👨', '👧', '👦', '👩‍🦰', '🧔', '👴', '👵', '🤴', '👸', '🦸', '🦹', '🧙', '🧚', '🧛', '🧜', '🧝', '🧞', '🧟'];
+
+  const handleCreate = async () => {
+    if (!newProfileName.trim()) return;
+    const newProfile: Profile = {
+      id: `profile_${Date.now()}`,
+      name: newProfileName.trim(),
+      avatar: avatars[Math.floor(Math.random() * avatars.length)],
+    };
+    await onCreateProfile(newProfile);
+    setNewProfileName('');
+    setShowCreate(false);
+  };
+
+  if (showCreate) {
+    return (
+      <View style={stylesTV.profileFullScreen}>
+        <LinearGradient colors={['#0a0a12', '#1a0a20']} style={StyleSheet.absoluteFill} />
+        <View style={stylesTV.profileCreateFull}>
+          <Text style={stylesTV.profileCreateTitleFull}>Crear perfil</Text>
+          <TextInput
+            style={stylesTV.profileInputFull}
+            placeholder="Nombre del perfil"
+            placeholderTextColor="rgba(255,255,255,0.5)"
+            value={newProfileName}
+            onChangeText={setNewProfileName}
+            autoFocus={!isTV}
+            onSubmitEditing={handleCreate}
+          />
+          <View style={stylesTV.profileCreateActionsFull}>
+            <Focusable style={[stylesTV.resumeBtn, stylesTV.resumeBtnPrimary]} onPress={handleCreate}>
+              <Text style={stylesTV.resumeBtnText}>Crear</Text>
+            </Focusable>
+            <Focusable style={[stylesTV.resumeBtn, stylesTV.resumeBtnSecondary]} onPress={() => setShowCreate(false)}>
+              <Text style={stylesTV.resumeBtnText}>Cancelar</Text>
+            </Focusable>
+          </View>
+        </View>
+      </View>
+    );
+  }
+
+  return (
+    <View style={stylesTV.profileFullScreen}>
+      <LinearGradient colors={['#0a0a12', '#1a0a20']} style={StyleSheet.absoluteFill} />
+      <View style={stylesTV.profileFullContent}>
+        <Text style={stylesTV.profileFullTitle}>¿Quién está viendo?</Text>
+        <View style={stylesTV.profileFullList}>
+          {profiles.map((p) => (
+            <Focusable
+              key={p.id}
+              style={stylesTV.profileFullItem}
+              onPress={() => onSelectProfile(p.id)}
+              hasTVPreferredFocus={p === profiles[0]}
+              tvParallaxProperties={{ enabled: true, shiftDistanceX: 15, shiftDistanceY: 15, tiltAngle: 0.1, magnification: 1.1 }}
+            >
+              <View style={stylesTV.profileFullAvatarContainer}>
+                <Text style={stylesTV.profileFullAvatar}>{p.avatar}</Text>
+                {profiles.length > 1 && (
+                  <TouchableOpacity style={stylesTV.profileFullDelete} onPress={() => onDeleteProfile(p.id)} activeOpacity={0.6}>
+                    <Ionicons name="close-circle" size={rs(32)} color="#ff1744" />
+                  </TouchableOpacity>
+                )}
+              </View>
+              <Text style={stylesTV.profileFullName}>{p.name}</Text>
+            </Focusable>
+          ))}
+          <Focusable style={stylesTV.profileFullAdd} onPress={() => setShowCreate(true)}>
+            <View style={stylesTV.profileFullAddCircle}>
+              <Ionicons name="add" size={rs(60)} color="#fff" />
+            </View>
+            <Text style={stylesTV.profileFullAddText}>Agregar perfil</Text>
+          </Focusable>
+        </View>
+        <Text style={stylesTV.profileFullHint}>Selecciona un perfil para comenzar</Text>
+      </View>
+    </View>
+  );
+});
+
+// ============================================================
+// COMPONENTE: BÚSQUEDA GLOBAL
+// ============================================================
+const GlobalSearch = memo(({ visible, onClose, movies, series, anime, doramas, channels, onPlayMedia, onSelectShow, onSelectChannel }: any) => {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState<any[]>([]);
+
+  useEffect(() => {
+    if (!query.trim()) { setResults([]); return; }
+    const q = query.toLowerCase().trim();
+    const allResults: any[] = [];
+    movies.forEach((m: MediaItem) => {
+      if (m.title.toLowerCase().includes(q)) allResults.push({ ...m, _type: 'movie', _source: 'Película' });
+    });
+    series.forEach((s: PlexShow) => {
+      if (s.title.toLowerCase().includes(q)) allResults.push({ ...s, _type: 'series', _source: 'Serie' });
+    });
+    anime.forEach((s: PlexShow) => {
+      if (s.title.toLowerCase().includes(q)) allResults.push({ ...s, _type: 'anime', _source: 'Anime' });
+    });
+    doramas.forEach((s: PlexShow) => {
+      if (s.title.toLowerCase().includes(q)) allResults.push({ ...s, _type: 'dorama', _source: 'Dorama' });
+    });
+    channels.forEach((c: Canal) => {
+      if (c.name.toLowerCase().includes(q)) allResults.push({ ...c, _type: 'channel', _source: 'Canal TV' });
+    });
+    setResults(allResults.slice(0, 50));
+  }, [query, movies, series, anime, doramas, channels]);
+
+  const renderItem = ({ item }: { item: any }) => {
+    const isMedia = item._type === 'movie' || item._type === 'series' || item._type === 'anime' || item._type === 'dorama';
+    const isChannel = item._type === 'channel';
+    const poster = isMedia ? item.poster : item.logo || 'https://via.placeholder.com/500x750.png?text=Canal';
+    return (
+      <Focusable
+        style={stylesTV.searchResultItem}
+        onPress={() => {
+          if (isChannel) {
+            onSelectChannel(item);
+            onClose();
+          } else if (item._type === 'movie' && item.streamUrl) {
+            onPlayMedia(item, 'movie', item.title, item.streamUrl, item.poster, undefined, undefined, undefined, 0, item.audioStreams, item.subtitleStreams);
+            onClose();
+          } else if ((item._type === 'series' || item._type === 'anime' || item._type === 'dorama') && item.seasons) {
+            onSelectShow(item);
+            onClose();
+          } else {
+            Alert.alert('Info', 'Contenido no disponible para reproducción directa');
+          }
+        }}
+      >
+        <Image source={{ uri: poster }} style={stylesTV.searchResultPoster} />
+        <View style={stylesTV.searchResultInfo}>
+          <Text style={stylesTV.searchResultTitle} numberOfLines={2}>{item.title || item.name}</Text>
+          <Text style={stylesTV.searchResultSource}>{item._source}</Text>
+          {isMedia && item.year && <Text style={stylesTV.searchResultYear}>{item.year}</Text>}
+          {isChannel && item.nowPlaying && <Text style={stylesTV.searchResultNow}>{item.nowPlaying}</Text>}
+        </View>
+      </Focusable>
+    );
+  };
+
+  return (
+    <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
+      <View style={stylesTV.searchContainer}>
+        <View style={stylesTV.searchHeader}>
+          <Ionicons name="search" size={rs(32)} color="rgba(255,255,255,0.6)" />
+          <TextInput
+            style={stylesTV.searchInput}
+            placeholder="Buscar películas, series, canales..."
+            placeholderTextColor="rgba(255,255,255,0.5)"
+            value={query}
+            onChangeText={setQuery}
+            autoFocus={!isTV}
+          />
+          <Focusable onPress={onClose} style={stylesTV.closeOverlayBtn}>
+            <Ionicons name="close" size={rs(32)} color="#fff" />
+          </Focusable>
+        </View>
+        {query.trim() === '' ? (
+          <View style={stylesTV.searchEmpty}>
+            <Ionicons name="search-outline" size={rs(80)} color="rgba(255,255,255,0.2)" />
+            <Text style={stylesTV.searchEmptyText}>Busca contenido en toda la plataforma</Text>
+          </View>
+        ) : results.length === 0 ? (
+          <View style={stylesTV.searchEmpty}>
+            <Ionicons name="sad-outline" size={rs(80)} color="rgba(255,255,255,0.2)" />
+            <Text style={stylesTV.searchEmptyText}>No se encontraron resultados para "{query}"</Text>
+          </View>
+        ) : (
+          <FlatList
+            data={results}
+            keyExtractor={(item, index) => `${item.id || item._type}-${index}`}
+            renderItem={renderItem}
+            numColumns={getGridColumns()}
+            contentContainerStyle={stylesTV.searchResultsList}
+          />
+        )}
+      </View>
+    </Modal>
+  );
+});
+
+// ============================================================
+// COMPONENTE: LISTA DE CANALES
+// ============================================================
+const ChannelList = memo(({ channels, currentChannel, favorites, onSelectChannel, onToggleFavorite, onClose, isOverlay = false }: any) => {
+  const listRef = useRef<FlatList>(null);
+  const renderChannel = ({ item, index }: { item: Canal; index: number }) => {
+    const isActive = currentChannel?.id === item.id;
+    const isFav = favorites.includes(item.id);
+    return (
+      <Focusable
+        style={[
+          stylesTV.channelItem,
+          isActive && stylesTV.channelItemActive,
+        ]}
+        onPress={() => {
+          onSelectChannel(item);
+          if (isOverlay && onClose) onClose();
+        }}
+        onLongPress={() => {
+          onToggleFavorite(item.id);
+          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+        }}
+        hasTVPreferredFocus={index === 0 && !isOverlay}
+      >
+        <View style={stylesTV.channelLogoContainer}>
+          {item.logo ? (
+            <Image source={{ uri: item.logo }} style={stylesTV.channelLogo} />
+          ) : (
+            <Text style={stylesTV.channelLogoFallback}>{item.numero}</Text>
+          )}
+        </View>
+        <View style={stylesTV.channelInfo}>
+          <Text style={stylesTV.channelName} numberOfLines={1}>{item.name}</Text>
+          {item.nowPlaying && <Text style={stylesTV.channelNow} numberOfLines={1}>{item.nowPlaying}</Text>}
+        </View>
+        {isActive && <View style={stylesTV.channelActiveIndicator}><Ionicons name="play" size={rs(20)} color="#ff1744" /></View>}
+        {isFav && !isActive && <Ionicons name="star" size={rs(22)} color="#F5C842" style={{ marginLeft: 4 }} />}
+      </Focusable>
+    );
+  };
+
+  return (
+    <View style={[stylesTV.channelListContainer, isOverlay && stylesTV.channelListOverlay]}>
+      {isOverlay && (
+        <View style={stylesTV.channelListHeader}>
+          <Text style={stylesTV.rightTitle}>📺 CANALES</Text>
+          <Focusable onPress={onClose} style={stylesTV.closeOverlayBtn}>
+            <Ionicons name="close" size={rs(32)} color="#fff" />
+          </Focusable>
+        </View>
+      )}
+      <FlatList
+        ref={listRef}
+        data={channels}
+        keyExtractor={(item: Canal) => item.id}
+        renderItem={renderChannel}
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={{ paddingBottom: rs(40) }}
+      />
+    </View>
+  );
+});
+
+// ============================================================
+// COMPONENTE: REPRODUCTOR EN MINIATURA (TV en vivo)
+// CON SELECTOR NATIVO / WEBVIEW Y DETECCIÓN AUTOMÁTICA DE EMBEDS
+// ============================================================
+const LivePlayerMini = memo(({
+  url,
+  channel,
+  loading,
+  onToggleFullscreen,
+  onToggleChannelOverlay,
+  fullscreen = false,
+  sourceOptions = [],
+  selectedSourceIndex = 0,
+  onSelectSource,
+  onSourceError
+}: any) => {
+  const [isPlaying, setIsPlaying] = useState(true);
+  const [controlsVisible, setControlsVisible] = useState(false);
+  const controlsAnim = useRef(new Animated.Value(0)).current;
+  const hideTimeout = useRef<NodeJS.Timeout | null>(null);
+  const [sourceModalVisible, setSourceModalVisible] = useState(false);
+
+  // --- ESTADO PARA SELECCIONAR WEBVIEW ---
+  const [useWebView, setUseWebView] = useState(false);
+
+  const messages = [
+    "📢 Aviso: Estamos mejorando la calidad del servicio.",
+    "🚀 Día a día estamos trabajando para mejorar.",
+    "🎬 Pronto más contenido exclusivo.",
+    "📡 Disfruta de la mejor programación.",
+    "💡 Sugerencias: escríbenos a soporte@nexustv.com",
+    "🔥 No te pierdas los estrenos de esta semana.",
+  ];
+  const [currentMessageIndex, setCurrentMessageIndex] = useState(0);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setCurrentMessageIndex((prev) => (prev + 1) % messages.length);
+    }, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Reproductor nativo
+  const player = useVideoPlayer(url && url.startsWith('http') && !useWebView ? url : null, (p) => {
+    if (url && url.startsWith('http') && !useWebView) {
+      p.loop = false;
+      p.play();
+      setIsPlaying(true);
+    }
+  }, [url, useWebView]);
+
+  // Efecto para escuchar errores del reproductor nativo
+  useEffect(() => {
+    if (!player || useWebView) return;
+    const sub = player.addListener('statusChange', (p: any) => {
+      if (p?.error) {
+        console.log('[LIVE-PLAYER] ERROR', p.error);
+        if (onSourceError) onSourceError();
+      }
+    });
+    return () => sub.remove();
+  }, [player, onSourceError, useWebView]);
+
+  // Forzar WebView para embeds, tvenvivo2, playlist.php, stream.php o bixplay.online
+  useEffect(() => {
+    if (url && (url.includes('embed.saohgdasregions.fun/embed/') ||
+                url.includes('tvenvivo2.com') ||
+                url.includes('playlist.php') ||
+                url.includes('stream.php') ||
+                url.includes('bixplay.online'))) {
+      console.log('[LivePlayerMini] Detectado embed, tvenvivo2, playlist, stream.php o BixPlay, usando WebView');
+      setUseWebView(true);
+    }
+  }, [url]);
+
+  // Ocultar controles automáticamente
+  useEffect(() => {
+    if (controlsVisible) {
+      if (hideTimeout.current) clearTimeout(hideTimeout.current);
+      hideTimeout.current = setTimeout(() => {
+        setControlsVisible(false);
+        Animated.timing(controlsAnim, { toValue: 0, duration: 300, easing: Easing.out(Easing.ease), useNativeDriver: true }).start();
+      }, 4000);
+    }
+    return () => {
+      if (hideTimeout.current) clearTimeout(hideTimeout.current);
+    };
+  }, [controlsVisible]);
+
+  const showControls = () => {
+    setControlsVisible(true);
+    Animated.timing(controlsAnim, { toValue: 1, duration: 200, useNativeDriver: true }).start();
+  };
+
+  const togglePlay = () => {
+    if (useWebView) return; // En WebView los controles los maneja el navegador
+    if (player.playing) {
+      player.pause();
+      setIsPlaying(false);
+    } else {
+      player.play();
+      setIsPlaying(true);
+    }
+    showControls();
+  };
+
+  // --- FUNCIÓN PARA CAMBIAR A WEBVIEW (manual) ---
+  const toggleWebView = () => {
+    if (useWebView) {
+      // Volviendo al nativo: pausamos el WebView y reanudamos el nativo
+      setUseWebView(false);
+      if (player) {
+        player.play();
+        setIsPlaying(true);
+      }
+    } else {
+      // Cambiando a WebView: pausamos el nativo
+      if (player) {
+        player.pause();
+        setIsPlaying(false);
+      }
+      setUseWebView(true);
+    }
+    showControls();
+  };
+
+  const showPlayer = !loading && url && url.startsWith('http');
+
+  // --- MODO WEBVIEW ---
+  if (useWebView && url) {
+    return (
+      <View style={{ flex: 1, backgroundColor: '#000' }}>
+        <WebViewPlayer
+          url={url}
+          onClose={toggleWebView}
+          title={channel?.name || 'TV en vivo'}
+          fullscreen={true}
+        />
+        <TouchableOpacity
+          style={{ position: 'absolute', top: 40, right: 20, zIndex: 10 }}
+          onPress={toggleWebView}
+        >
+          <Ionicons name="close" size={40} color="#fff" />
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  // --- MODO REPRODUCTOR NATIVO ---
+  return (
+    <View style={stylesTV.liveContainer}>
+      <View style={{ flex: fullscreen ? 1 : 0.85, backgroundColor: '#000', position: 'relative', overflow: 'hidden' }}>
+        {showPlayer ? (
+          <>
+            <VideoView style={StyleSheet.absoluteFill} player={player} contentFit="fill" nativeControls={false} onTouchStart={showControls} />
+            <Animated.View style={[stylesTV.miniControls, { opacity: controlsAnim }]} pointerEvents={controlsVisible ? 'box-none' : 'none'}>
+              <LinearGradient colors={['rgba(0,0,0,0.8)', 'transparent', 'rgba(0,0,0,0.8)']} style={StyleSheet.absoluteFill} pointerEvents="none" />
+              <View style={stylesTV.miniTopBar}>
+                <Text style={stylesTV.miniTitle} numberOfLines={1}>{channel?.name || 'TV en vivo'}</Text>
+                <View style={stylesTV.miniActions}>
+                  {/* BOTÓN PARA CAMBIAR A WEBVIEW */}
+                  <Focusable onPress={toggleWebView} style={[stylesTV.miniBtn, { backgroundColor: 'rgba(0,0,0,0.6)' }]}>
+                    <Ionicons name="globe-outline" size={rs(34)} color="#fff" />
+                  </Focusable>
+                  {sourceOptions.length > 1 && fullscreen && (
+                    <Focusable onPress={() => setSourceModalVisible(true)} style={[stylesTV.miniBtn, { backgroundColor: 'rgba(0,0,0,0.6)' }]}>
+                      <Ionicons name="radio-outline" size={rs(34)} color="#fff" />
+                    </Focusable>
+                  )}
+                  <Focusable onPress={onToggleFullscreen} style={[stylesTV.miniBtn, { backgroundColor: 'rgba(0,0,0,0.6)' }]}>
+                    <Ionicons name={fullscreen ? "contract-outline" : "expand-outline"} size={rs(34)} color="#fff" />
+                  </Focusable>
+                  <Focusable onPress={onToggleChannelOverlay} style={[stylesTV.miniBtn, { backgroundColor: 'rgba(0,0,0,0.6)' }]}>
+                    <Ionicons name="list" size={rs(34)} color="#fff" />
+                  </Focusable>
+                </View>
+              </View>
+              <View style={stylesTV.miniCenter}>
+                <Focusable style={stylesTV.miniPlayBtn} onPress={togglePlay}>
+                  <LinearGradient colors={['#ff1744', '#d50000']} style={stylesTV.miniPlayGradient} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }}>
+                    <Ionicons name={isPlaying ? 'pause' : 'play'} size={rs(56)} color="#fff" />
+                  </LinearGradient>
+                </Focusable>
+              </View>
+            </Animated.View>
+            <SourceSelectorModal visible={sourceModalVisible} options={sourceOptions} selectedIndex={selectedSourceIndex} onSelect={onSelectSource} onClose={() => setSourceModalVisible(false)} />
+          </>
+        ) : (
+          <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#000' }}>
+            <ActivityIndicator size="large" color="#ff1744" />
+            <Text style={stylesTV.loadingText}>Cargando señal...</Text>
+          </View>
+        )}
+      </View>
+
+      {!fullscreen && (
+        <View style={stylesTV.messagesSection}>
+          <LinearGradient
+            colors={['rgba(10,10,26,0.95)', 'rgba(20,10,30,0.95)']}
+            style={StyleSheet.absoluteFill}
+            start={{ x: 0, y: 0 }}
+            end={{ x: 1, y: 1 }}
+          />
+          <View style={stylesTV.messagesContainer}>
+            <Ionicons name="information-circle-outline" size={rs(36)} color="rgba(255,255,255,0.6)" style={stylesTV.messageIcon} />
+            <Text style={stylesTV.messageText} key={currentMessageIndex}>
+              {loading ? '🔄 Cargando señal...' : messages[currentMessageIndex]}
+            </Text>
+          </View>
+        </View>
+      )}
+    </View>
+  );
+});
+
+// ============================================================
+// COMPONENTE: WEBVIEW PLAYER (con soporte para iframe, stream.php y HLS)
+// ============================================================
+const WebViewPlayer = memo(({ url, onClose, title, fullscreen = false }: { url: string; onClose: () => void; title?: string; fullscreen?: boolean }) => {
+  const webViewRef = useRef<WebView>(null);
+  const isEmbed = url && url.includes('embed.saohgdasregions.fun/embed/');
+  const isStreamPage = url && (url.includes('stream.php') || url.includes('tvenvivo2.com') || url.includes('bixplay.online'));
+
+  useEffect(() => {
+    console.log('[WebViewPlayer] Abriendo URL:', url);
+    lockLandscape();
+    return () => {};
+  }, [url]);
+
+  // Script para autoplay (forzar reproducción)
+  const injectedJS = `
+    (function() {
+      function findAndPlay() {
+        var video = document.querySelector('video');
+        if (video) {
+          video.muted = true;
+          video.play().catch(function(e) {});
+          video.click();
+          return true;
+        }
+        var container = document.querySelector('.player-container, #player, .clappr-player, [data-player]');
+        if (container) {
+          container.click();
+          var vid = container.querySelector('video');
+          if (vid) {
+            vid.muted = true;
+            vid.play().catch(function(e) {});
+            vid.click();
+          }
+          return true;
+        }
+        if (window.player && typeof window.player.play === 'function') {
+          window.player.play();
+          return true;
+        }
+        return false;
+      }
+
+      var attempts = 0;
+      var interval = setInterval(function() {
+        if (findAndPlay() || attempts > 20) {
+          clearInterval(interval);
+        }
+        attempts++;
+      }, 500);
+
+      window.addEventListener('load', function() {
+        setTimeout(findAndPlay, 1000);
+        setTimeout(findAndPlay, 3000);
+      });
+
+      if (window.MutationObserver) {
+        var observer = new MutationObserver(function() {
+          findAndPlay();
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+        setTimeout(function() { observer.disconnect(); }, 10000);
+      }
+    })();
+  `;
+
+  // Si es un embed, generamos un HTML con iframe
+  const iframeHtml = `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <style>
+          * { margin:0; padding:0; }
+          html, body { width:100%; height:100%; background:#000; overflow:hidden; }
+          #frame-container { width:100vw; height:100vh; border:none; }
+          iframe { width:100%; height:100%; border:0; display:block; }
+        </style>
+      </head>
+      <body>
+        <div id="frame-container">
+          <iframe
+            src="${url}"
+            frameborder="0"
+            allowfullscreen
+            allow="autoplay; encrypted-media; fullscreen"
+            referrerpolicy="no-referrer-when-downgrade"
+          ></iframe>
+        </div>
+        <script>
+          // Intentar autoplay dentro del iframe
+          setTimeout(function() {
+            var iframe = document.querySelector('iframe');
+            if (iframe) {
+              try {
+                var doc = iframe.contentDocument || iframe.contentWindow.document;
+                var video = doc.querySelector('video');
+                if (video) {
+                  video.muted = true;
+                  video.play().catch(function(e) {});
+                }
+                var container = doc.querySelector('.player-container, #player');
+                if (container) container.click();
+              } catch(e) {}
+            }
+          }, 3000);
+        <\/script>
+      </body>
+    </html>
+  `;
+
+  // Si es stream.php o BixPlay, cargamos directamente con headers
+  const streamSource = {
+    uri: url,
+    headers: {
+      Referer: 'https://embed.saohgdasregions.fun/',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+  };
+
+  // Si no es embed ni streamPage, usamos el reproductor HLS
+  const hlsHtml = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+      <style>
+        body { margin: 0; background: #000; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; }
+        video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+      </style>
+    </head>
+    <body>
+      <video id="video" controls autoplay playsinline></video>
+      <script src="https://cdn.jsdelivr.net/npm/hls.js@0.14.17/dist/hls.min.js"><\/script>
+      <script>
+        (function() {
+          var video = document.getElementById('video');
+          var streamUrl = '${url}';
+          if (Hls.isSupported()) {
+            var hls = new Hls({ enableWorker: true, lowLatencyMode: true });
+            hls.loadSource(streamUrl);
+            hls.attachMedia(video);
+            hls.on(Hls.Events.MANIFEST_PARSED, function() {
+              video.play().catch(function(e) { console.log('Autoplay blocked', e); });
+            });
+            hls.on(Hls.Events.ERROR, function(event, data) {
+              if (data.fatal) { console.log('HLS Fatal Error', data); }
+            });
+          } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            video.src = streamUrl;
+            video.addEventListener('loadedmetadata', function() { video.play(); });
+          } else {
+            document.body.innerHTML = 'Reproductor no soportado.';
+          }
+        })();
+      <\/script>
+    </body>
+    </html>
+  `;
+
+  let source;
+  if (isEmbed) {
+    source = { html: iframeHtml };
+  } else if (isStreamPage) {
+    source = streamSource;
+  } else {
+    source = { html: hlsHtml };
+  }
+
+  return (
+    <View style={{ flex: 1, backgroundColor: '#000' }}>
+      <WebView
+        ref={webViewRef}
+        originWhitelist={['*']}
+        source={source}
+        style={{ flex: 1, backgroundColor: '#000' }}
+        mediaPlaybackRequiresUserAction={false}
+        allowsInlineMediaPlayback
+        allowsFullscreenVideo
+        javaScriptEnabled
+        domStorageEnabled
+        mixedContentMode="always"
+        userAgent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        injectedJavaScript={isStreamPage ? injectedJS : undefined}
+        onLoadEnd={() => {
+          if (isStreamPage && webViewRef.current) {
+            setTimeout(() => {
+              webViewRef.current?.injectJavaScript(injectedJS);
+            }, 1000);
+          }
+        }}
+        onError={(e) => console.log('[WebViewPlayer] Error:', e.nativeEvent)}
+      />
+      <TouchableOpacity
+        style={{ position: 'absolute', top: 40, right: 20, zIndex: 10 }}
+        onPress={onClose}
+      >
+        <Ionicons name="close" size={40} color="#fff" />
+      </TouchableOpacity>
+    </View>
+  );
+});
+
+// ============================================================
+// HEADER SUPERIOR (con badges de estado)
+// ============================================================
+const AppHeader = memo(({ onSettingsPress, onHistoryPress, onContinueWatchingPress, onSearchPress, onProfilePress, userName = 'Invitado', avatarUrl, daysLeft, isActivated, onActivatePress, onRenewPress, onSyncPress, onRefreshChannelsPress }: any) => {
+  return (
+    <LinearGradient colors={['rgba(20,10,30,0.95)', 'rgba(10,10,20,0.9)']} style={stylesTV.headerContainer} start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }}>
+      <View style={stylesTV.headerLeft}>
+        <Focusable onPress={onProfilePress} style={stylesTV.avatarContainer}>
+          {avatarUrl ? (
+            <Image source={{ uri: avatarUrl }} style={stylesTV.avatar} />
+          ) : (
+            <LinearGradient colors={['#ff1744', '#d50000']} style={stylesTV.avatarPlaceholder}>
+              <Ionicons name="person" size={rs(32)} color="#fff" />
+            </LinearGradient>
+          )}
+        </Focusable>
+        <Text style={stylesTV.userName}>{userName}</Text>
+
+        {/* Badges de estado */}
+        {isActivated && daysLeft !== undefined && daysLeft > 0 ? (
+          <View style={stylesTV.badgePremium}>
+            <Ionicons name="star" size={rs(24)} color="#FFD700" />
+            <Text style={stylesTV.badgeText}>Premium {daysLeft}d</Text>
+          </View>
+        ) : daysLeft !== undefined && daysLeft > 0 && !isActivated ? (
+          <View style={stylesTV.badgeTrial}>
+            <Ionicons name="hourglass-outline" size={rs(24)} color="#FFA500" />
+            <Text style={stylesTV.badgeText}>Prueba {daysLeft}d</Text>
+          </View>
+        ) : isActivated && daysLeft === 0 ? (
+          <View style={stylesTV.badgeExpired}>
+            <Ionicons name="alert-circle-outline" size={rs(24)} color="#ff1744" />
+            <Text style={[stylesTV.badgeText, { color: '#ff1744' }]}>Expirado</Text>
+          </View>
+        ) : null}
+      </View>
+      <View style={stylesTV.headerRight}>
+        {!isActivated && (
+          <Focusable style={[stylesTV.headerBtn, { backgroundColor: 'rgba(76,175,80,0.2)', borderColor: '#4CAF50' }]} onPress={onActivatePress}>
+            <Ionicons name="key-outline" size={rs(28)} color="#4CAF50" />
+            <Text style={[stylesTV.headerBtnText, { color: '#4CAF50', fontSize: rs(18) }]}>Activar</Text>
+          </Focusable>
+        )}
+        {isActivated && daysLeft !== undefined && daysLeft < 10 && (
+          <Focusable style={[stylesTV.headerBtn, { backgroundColor: 'rgba(255,152,0,0.2)', borderColor: '#FF9800' }]} onPress={onRenewPress}>
+            <Ionicons name="refresh-outline" size={rs(28)} color="#FF9800" />
+            <Text style={[stylesTV.headerBtnText, { color: '#FF9800', fontSize: rs(18) }]}>Renovar</Text>
+          </Focusable>
+        )}
+        <Focusable style={[stylesTV.headerBtn, stylesTV.headerBtnPrimary]} onPress={onSearchPress}>
+          <Ionicons name="search" size={rs(28)} color="#fff" />
+          <Text style={stylesTV.headerBtnText}>Buscar</Text>
+        </Focusable>
+        <Focusable style={[stylesTV.headerBtn, stylesTV.headerBtnSecondary]} onPress={onHistoryPress}>
+          <Ionicons name="calendar-outline" size={rs(28)} color="#fff" />
+          <Text style={stylesTV.headerBtnText}>Historial</Text>
+        </Focusable>
+        <Focusable style={[stylesTV.headerBtn, stylesTV.headerBtnSecondary]} onPress={onSettingsPress}>
+          <Ionicons name="settings-outline" size={rs(28)} color="#fff" />
+          <Text style={stylesTV.headerBtnText}>Ajustes</Text>
+        </Focusable>
+      </View>
+    </LinearGradient>
+  );
+});
+
+// ============================================================
+// VISTAS: CONTINUAR VIENDO, HISTORIAL, AJUSTES
+// ============================================================
+const ContinueWatchingView = memo(({ items, onPlay }: any) => {
+  const renderItem = ({ item, index }: { item: ContinueWatchingItem; index: number }) => {
+    const progressPercent = item.duration > 0 ? (item.progress / item.duration) * 100 : 0;
+    const isWatched = progressPercent > 90;
+    const itemWidth = getGridItemWidth();
+    return (
+      <Focusable
+        style={[stylesTV.gridItem, { width: itemWidth, marginRight: '2%', marginBottom: rs(32) }]}
+        onPress={() => onPlay(item)}
+        tvParallaxProperties={{ enabled: true, shiftDistanceX: 15, shiftDistanceY: 15, tiltAngle: 0.1, magnification: 1.1 }}
+        hasTVPreferredFocus={index === 0}
+      >
+        <View style={stylesTV.gridPosterContainer}>
+          <Image source={{ uri: item.poster }} style={stylesTV.gridPoster} />
+          <View style={[stylesTV.continueProgressBar, { position: 'absolute', bottom: 0, left: 0, right: 0, height: rs(8), backgroundColor: 'rgba(0,0,0,0.7)' }]}>
+            <View style={[stylesTV.continueProgressFill, { width: `${Math.min(progressPercent, 100)}%` }]} />
+          </View>
+          {isWatched && (
+            <View style={[stylesTV.gridRating, { top: 8, right: 8, bottom: undefined }]}>
+              <Text style={{ color: '#4CAF50', fontSize: rs(16), fontWeight: '700' }}>✓ Visto</Text>
+            </View>
+          )}
+        </View>
+        <Text style={stylesTV.gridTitle} numberOfLines={2}>{item.title}</Text>
+        {item.showName && <Text style={stylesTV.gridSubtitle}>{item.showName}</Text>}
+      </Focusable>
+    );
+  };
+
+  return (
+    <View style={stylesTV.gridContainer}>
+      <Text style={stylesTV.gridSectionTitle}>⏳ Continuar viendo</Text>
+      {items.length === 0 ? (
+        <View style={stylesTV.centerLoading}>
+          <Ionicons name="tv-outline" size={rs(80)} color="rgba(255,255,255,0.3)" />
+          <Text style={stylesTV.loadingText}>No hay contenido en "Continuar viendo"</Text>
+        </View>
+      ) : (
+        <FlatList
+          data={items}
+          keyExtractor={(item) => item.id}
+          numColumns={getGridColumns()}
+          renderItem={renderItem}
+          contentContainerStyle={{ paddingBottom: rs(40), justifyContent: 'space-between' }}
+          showsVerticalScrollIndicator={false}
+        />
+      )}
+    </View>
+  );
+});
+
+const HistoryView = memo(({ items, onPlay }: any) => {
+  const renderItem = ({ item, index }: { item: ContinueWatchingItem; index: number }) => {
+    const progressPercent = item.duration > 0 ? (item.progress / item.duration) * 100 : 0;
+    const itemWidth = getGridItemWidth();
+    return (
+      <Focusable
+        style={[stylesTV.gridItem, { width: itemWidth, marginRight: '2%', marginBottom: rs(32) }]}
+        onPress={() => onPlay(item)}
+        tvParallaxProperties={{ enabled: true, shiftDistanceX: 15, shiftDistanceY: 15, tiltAngle: 0.1, magnification: 1.1 }}
+        hasTVPreferredFocus={index === 0}
+      >
+        <View style={stylesTV.gridPosterContainer}>
+          <Image source={{ uri: item.poster }} style={stylesTV.gridPoster} />
+          <View style={[stylesTV.continueProgressBar, { position: 'absolute', bottom: 0, left: 0, right: 0, height: rs(8), backgroundColor: 'rgba(0,0,0,0.7)' }]}>
+            <View style={[stylesTV.continueProgressFill, { width: `${Math.min(progressPercent, 100)}%` }]} />
+          </View>
+        </View>
+        <Text style={stylesTV.gridTitle} numberOfLines={2}>{item.title}</Text>
+        {item.showName && <Text style={stylesTV.gridSubtitle}>{item.showName}</Text>}
+      </Focusable>
+    );
+  };
+
+  return (
+    <View style={stylesTV.gridContainer}>
+      <Text style={stylesTV.gridSectionTitle}>📜 Historial</Text>
+      {items.length === 0 ? (
+        <View style={stylesTV.centerLoading}>
+          <Ionicons name="calendar-outline" size={rs(80)} color="rgba(255,255,255,0.3)" />
+          <Text style={stylesTV.loadingText}>No hay historial de reproducción</Text>
+        </View>
+      ) : (
+        <FlatList
+          data={items}
+          keyExtractor={(item) => item.id}
+          numColumns={getGridColumns()}
+          renderItem={renderItem}
+          contentContainerStyle={{ paddingBottom: rs(40), justifyContent: 'space-between' }}
+          showsVerticalScrollIndicator={false}
+        />
+      )}
+    </View>
+  );
+});
+
+const SettingsView = memo(({ onActivatePress, onRenewPress, isActivated, daysLeft, onSyncPress, onRefreshChannelsPress, deviceId }: any) => {
+  const [deviceInfo, setDeviceInfo] = useState<any>({});
+  useEffect(() => {
+    setDeviceInfo({
+      appVersion: Constants.expoConfig?.version || Constants.manifest?.version || '1.0.0',
+      brand: Device.brand || 'Desconocido',
+      mac: Device.macAddress || 'No disponible',
+    });
+  }, []);
+  const openWhatsApp = () => {
+    const url = `https://wa.me/5492995958958?text=Hola%20NEXUS%20TV%2C%20tengo%20una%20consulta`;
+    Linking.openURL(url).catch(() => Alert.alert('Error', 'No se pudo abrir WhatsApp'));
+  };
+  return (
+    <View style={stylesTV.settingsContainer}>
+      <Text style={stylesTV.gridSectionTitle}>⚙️ Ajustes</Text>
+      <View style={stylesTV.settingsCard}>
+        <View style={stylesTV.settingsItem}>
+          <Ionicons name="information-circle-outline" size={rs(36)} color="#ff1744" />
+          <Text style={stylesTV.settingsLabel}>Versión de la app:</Text>
+          <Text style={stylesTV.settingsValue}>{deviceInfo.appVersion}</Text>
+        </View>
+        <View style={stylesTV.settingsItem}>
+          <Ionicons name="wifi-outline" size={rs(36)} color="#ff1744" />
+          <Text style={stylesTV.settingsLabel}>Dirección MAC:</Text>
+          <Text style={stylesTV.settingsValue}>{deviceInfo.mac}</Text>
+        </View>
+        {/* Nuevo: ID del dispositivo */}
+        <View style={stylesTV.settingsItem}>
+          <Ionicons name="hardware-chip-outline" size={rs(36)} color="#ff1744" />
+          <Text style={stylesTV.settingsLabel}>ID del dispositivo:</Text>
+          <Text style={stylesTV.settingsValue}>{deviceId || 'No disponible'}</Text>
+        </View>
+        <Focusable style={[stylesTV.settingsWhatsAppBtn, { backgroundColor: 'rgba(33,150,243,0.15)', borderColor: '#2196F3' }]} onPress={onSyncPress}>
+          <Ionicons name="sync-outline" size={rs(36)} color="#2196F3" />
+          <Text style={[stylesTV.settingsWhatsAppText, { color: '#2196F3' }]}>Sincronizar estado</Text>
+        </Focusable>
+        <Focusable style={[stylesTV.settingsWhatsAppBtn, { backgroundColor: 'rgba(255,152,0,0.15)', borderColor: '#FF9800' }]} onPress={onRefreshChannelsPress}>
+          <Ionicons name="refresh-circle-outline" size={rs(36)} color="#FF9800" />
+          <Text style={[stylesTV.settingsWhatsAppText, { color: '#FF9800' }]}>Actualizar canales</Text>
+        </Focusable>
+        {!isActivated && (
+          <Focusable style={[stylesTV.settingsWhatsAppBtn, { backgroundColor: 'rgba(76,175,80,0.15)', borderColor: '#4CAF50' }]} onPress={onActivatePress}>
+            <Ionicons name="key-outline" size={rs(36)} color="#4CAF50" />
+            <Text style={[stylesTV.settingsWhatsAppText, { color: '#4CAF50' }]}>Activar dispositivo</Text>
+          </Focusable>
+        )}
+        {isActivated && (daysLeft === undefined || daysLeft < 15) && (
+          <Focusable style={[stylesTV.settingsWhatsAppBtn, { backgroundColor: 'rgba(255,152,0,0.15)', borderColor: '#FF9800' }]} onPress={onRenewPress}>
+            <Ionicons name="refresh-outline" size={rs(36)} color="#FF9800" />
+            <Text style={[stylesTV.settingsWhatsAppText, { color: '#FF9800' }]}>Renovar suscripción</Text>
+          </Focusable>
+        )}
+        <Focusable style={stylesTV.settingsWhatsAppBtn} onPress={openWhatsApp}>
+          <Ionicons name="logo-whatsapp" size={rs(36)} color="#25D366" />
+          <Text style={stylesTV.settingsWhatsAppText}>Contactar por WhatsApp</Text>
+        </Focusable>
+      </View>
+    </View>
+  );
+});
+
+// ============================================================
+// REPRODUCTOR MEJORADO CON SIGUIENTE EPISODIO, CUENTA REGRESIVA
+// Y SELECTOR NATIVO / WEBVIEW
+// ============================================================
+const ReproductorMejorado = memo(({
+  url,
+  onClose,
+  title,
+  id,
+  poster,
+  type = 'movie',
+  showId,
+  showName,
+  episodeCode,
+  sourceOptions = [],
+  selectedSourceIndex = 0,
+  onSelectSource,
+  initialTime = 0,
+  nextEpisode = null,
+  onPlayNextEpisode = null,
+  autoPlayNext = true,
+  audioStreams = [],
+  subtitleStreams = [],
+}: any) => {
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [isPlaying, setIsPlaying] = useState(true);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [controlsVisible, setControlsVisible] = useState(true);
+  const [savedProgress, setSavedProgress] = useState(0);
+  const [sourceModalVisible, setSourceModalVisible] = useState(false);
+  const [tracksModalVisible, setTracksModalVisible] = useState(false);
+  const [hasSetInitialTime, setHasSetInitialTime] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
+  const [isClosing, setIsClosing] = useState(false);
+  const [showNextBanner, setShowNextBanner] = useState(false);
+  const [countdown, setCountdown] = useState(10);
+  const countdownInterval = useRef<NodeJS.Timeout | null>(null);
+
+  // ESTADO PARA SELECCIONAR WEBVIEW
+  const [useWebView, setUseWebView] = useState(false);
+
+  useKeepAwake();
+
+  const controlsAnim = useRef(new Animated.Value(1)).current;
+  const hideTimeout = useRef<NodeJS.Timeout | null>(null);
+  const saveIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const progressTrackRef = useRef<View>(null);
+
+  // Efecto para siguiente episodio
+  useEffect(() => {
+    if (duration > 0 && currentTime > 0 && duration - currentTime < 3 && duration - currentTime > 0) {
+      if (nextEpisode && onPlayNextEpisode && !showNextBanner) {
+        setShowNextBanner(true);
+        setCountdown(10);
+        if (countdownInterval.current) clearInterval(countdownInterval.current);
+        countdownInterval.current = setInterval(() => {
+          setCountdown(prev => {
+            if (prev <= 1) {
+              clearInterval(countdownInterval.current!);
+              if (autoPlayNext && onPlayNextEpisode) {
+                onPlayNextEpisode();
+              }
+              return 0;
+            }
+            return prev - 1;
+          });
+        }, 1000);
+      }
+    }
+  }, [currentTime, duration, nextEpisode, onPlayNextEpisode, autoPlayNext, showNextBanner]);
+
+  useEffect(() => {
+    return () => {
+      if (countdownInterval.current) clearInterval(countdownInterval.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    setShowNextBanner(false);
+    setCountdown(10);
+    if (countdownInterval.current) {
+      clearInterval(countdownInterval.current);
+      countdownInterval.current = null;
+    }
+  }, [url]);
+
+  useEffect(() => {
+    let tvEventHandler: any;
+    if (Platform.isTV) {
+      tvEventHandler = new TVEventHandler();
+      tvEventHandler.enable(this, (cmp: any, evt: any) => {
+        if (evt && evt.eventType === 'right') {
+          seek(5);
+        } else if (evt && evt.eventType === 'left') {
+          seek(-5);
+        }
+      });
+    }
+    return () => {
+      if (tvEventHandler) tvEventHandler.disable();
+    };
+  }, [duration]);
+
+  useEffect(() => {
+    if (!url || !url.startsWith('http')) {
+      setError('URL de stream inválida');
+      setLoading(false);
+    }
+  }, [url]);
+
+  // Forzar WebView para embeds, tvenvivo2, playlist.php, stream.php o bixplay.online
+  useEffect(() => {
+    if (url && (url.includes('embed.saohgdasregions.fun/embed/') ||
+                url.includes('tvenvivo2.com') ||
+                url.includes('playlist.php') ||
+                url.includes('stream.php') ||
+                url.includes('bixplay.online'))) {
+      console.log('[ReproductorMejorado] Detectado embed, tvenvivo2, playlist, stream.php o BixPlay, usando WebView');
+      setUseWebView(true);
+    }
+  }, [url]);
+
+  // REPRODUCTOR NATIVO
+  const player = useVideoPlayer(url && url.startsWith('http') ? url : null, (p) => {
+    p.loop = false;
+    p.play();
+    setIsPlaying(true);
+    if (initialTime > 0 && !hasSetInitialTime) {
+      p.currentTime = initialTime;
+      setCurrentTime(initialTime);
+      setHasSetInitialTime(true);
+    }
+  }, [url]);
+
+  // Pistas de audio / subtítulos
+  const { availableAudioTracks } = useEvent(player, 'availableAudioTracksChange', {
+    availableAudioTracks: player?.availableAudioTracks || [],
+  });
+  const { audioTrack } = useEvent(player, 'audioTrackChange', {
+    audioTrack: player?.audioTrack,
+  });
+  const { availableSubtitleTracks } = useEvent(player, 'availableSubtitleTracksChange', {
+    availableSubtitleTracks: player?.availableSubtitleTracks || [],
+  });
+  const { subtitleTrack } = useEvent(player, 'subtitleTrackChange', {
+    subtitleTrack: player?.subtitleTrack,
+  });
+
+  const appliedDefaultAudio = useRef(false);
+  useEffect(() => {
+    if (appliedDefaultAudio.current) return;
+    if (!availableAudioTracks || availableAudioTracks.length === 0) return;
+    appliedDefaultAudio.current = true;
+    const plexDefault = (audioStreams || []).find((s: PlexStreamInfo) => s.isDefault);
+    let match = null;
+    if (plexDefault) {
+      match = availableAudioTracks.find((t: any) =>
+        (t.language && plexDefault.languageCode && t.language.toLowerCase().startsWith(plexDefault.languageCode.toLowerCase())) ||
+        (t.label && plexDefault.title && t.label.toLowerCase().includes(plexDefault.title.toLowerCase()))
+      );
+    }
+    if (match && player) {
+      try { player.audioTrack = match; } catch (e) { console.log('[TRACKS] No se pudo fijar audio por defecto', e); }
+    }
+  }, [availableAudioTracks, audioStreams, player]);
+
+  const handleSelectAudioTrack = useCallback((track: any) => {
+    if (!player) return;
+    try {
+      player.audioTrack = track;
+    } catch (e) {
+      console.log('[TRACKS] Error al cambiar de audio', e);
+      Alert.alert('Idioma', 'No se pudo cambiar el idioma de audio en este dispositivo.');
+    }
+  }, [player]);
+
+  const handleSelectSubtitleTrack = useCallback((track: any | null) => {
+    if (!player) return;
+    try {
+      player.subtitleTrack = track;
+    } catch (e) {
+      console.log('[TRACKS] Error al cambiar de subtítulo', e);
+      Alert.alert('Subtítulos', 'No se pudieron activar los subtítulos en este dispositivo.');
+    }
+  }, [player]);
+
+  const hasTrackOptions = (availableAudioTracks && availableAudioTracks.length > 1) || (availableSubtitleTracks && availableSubtitleTracks.length > 0);
+
+  useEffect(() => {
+    if (player && initialTime > 0 && !hasSetInitialTime) {
+      player.currentTime = initialTime;
+      setCurrentTime(initialTime);
+      setHasSetInitialTime(true);
+    }
+  }, [player, initialTime]);
+
+  // Guardar progreso
+  useEffect(() => {
+    if (!player || !id) return;
+    saveIntervalRef.current = setInterval(() => {
+      const current = player.currentTime || 0;
+      const dur = (player as any).duration || 0;
+      if (dur > 0 && current > 5 && Math.abs(current - savedProgress) > 5) {
+        setSavedProgress(current);
+        saveContinueWatching({
+          id: id,
+          title: title,
+          poster: poster,
+          progress: current,
+          duration: dur,
+          type: type,
+          streamUrl: url,
+          showId: showId,
+          showName: showName,
+          episodeCode: episodeCode,
+          watchedAt: Date.now(),
+        });
+      }
+    }, 5000);
+    return () => {
+      if (saveIntervalRef.current) clearInterval(saveIntervalRef.current);
+    };
+  }, [player, id, savedProgress]);
+
+  // Cierre
+  const handleClose = useCallback(() => {
+    if (isClosing) return;
+    setIsClosing(true);
+    console.log('[PLAYER] Cerrando reproductor');
+    const current = player.currentTime || 0;
+    const dur = (player as any).duration || 0;
+    if (dur > 0 && current > 5 && id) {
+      saveContinueWatching({
+        id: id,
+        title: title,
+        poster: poster,
+        progress: current,
+        duration: dur,
+        type: type,
+        streamUrl: url,
+        showId: showId,
+        showName: showName,
+        episodeCode: episodeCode,
+        watchedAt: Date.now(),
+      });
+    }
+    if (countdownInterval.current) clearInterval(countdownInterval.current);
+    if (saveIntervalRef.current) clearInterval(saveIntervalRef.current);
+    if (hideTimeout.current) clearTimeout(hideTimeout.current);
+    try {
+      if (player && typeof player.pause === 'function') player.pause();
+    } catch (e) {}
+    onClose();
+  }, [isClosing, player, id, title, poster, type, url, showId, showName, episodeCode, onClose]);
+
+  // Controles
+  useEffect(() => {
+    if (controlsVisible) {
+      if (hideTimeout.current) clearTimeout(hideTimeout.current);
+      hideTimeout.current = setTimeout(() => {
+        setControlsVisible(false);
+        Animated.timing(controlsAnim, { toValue: 0, duration: 300, easing: Easing.out(Easing.ease), useNativeDriver: true }).start();
+      }, 3000);
+    }
+    return () => {
+      if (hideTimeout.current) clearTimeout(hideTimeout.current);
+    };
+  }, [controlsVisible]);
+
+  const showControls = () => {
+    setControlsVisible(true);
+    Animated.timing(controlsAnim, { toValue: 1, duration: 200, useNativeDriver: true }).start();
+  };
+
+  const togglePlay = () => {
+    if (player.playing) {
+      player.pause();
+      setIsPlaying(false);
+    } else {
+      player.play();
+      setIsPlaying(true);
+    }
+    showControls();
+  };
+
+  const seek = (seconds: number) => {
+    const newTime = Math.max(0, Math.min(duration, (player.currentTime || 0) + seconds));
+    player.currentTime = newTime;
+    setCurrentTime(newTime);
+    showControls();
+  };
+
+  const handleSeekBarPress = (event: any) => {
+    if (!progressTrackRef.current || duration <= 0) return;
+    progressTrackRef.current.measure((x, y, width, height, pageX, pageY) => {
+      if (width === 0) return;
+      let locationX = event.nativeEvent?.locationX;
+      if (locationX === undefined && event.nativeEvent?.pageX !== undefined) {
+        locationX = event.nativeEvent.pageX - pageX;
+      }
+      if (locationX === undefined) return;
+      const progress = Math.max(0, Math.min(1, locationX / width));
+      const newTime = progress * duration;
+      player.currentTime = newTime;
+      setCurrentTime(newTime);
+      showControls();
+    });
+  };
+
+  const handleRetry = () => {
+    setError(null);
+    setLoading(true);
+    setRetryCount(prev => prev + 1);
+    if (player) {
+      player.replace(url);
+    } else {
+      setLoading(false);
+      setLoading(true);
+    }
+  };
+
+  const handleNextEpisode = () => {
+    if (onPlayNextEpisode) {
+      onPlayNextEpisode();
+    }
+  };
+
+  const cancelAutoNext = () => {
+    if (countdownInterval.current) {
+      clearInterval(countdownInterval.current);
+      countdownInterval.current = null;
+    }
+    setShowNextBanner(false);
+    setCountdown(10);
+  };
+
+  // --- CAMBIAR A WEBVIEW ---
+  const toggleWebView = useCallback(() => {
+    if (useWebView) {
+      setUseWebView(false);
+      if (player) {
+        player.play();
+        setIsPlaying(true);
+      }
+    } else {
+      if (player) {
+        player.pause();
+        setIsPlaying(false);
+      }
+      setUseWebView(true);
+    }
+    showControls();
+  }, [useWebView, player]);
+
+  // Eventos de reproducción
+  useEffect(() => {
+    const sub1 = player.addListener('playingChange', (p: any) => {
+      const playing = p?.isPlaying ?? p;
+      setIsPlaying(!!playing);
+      if (playing) setLoading(false);
+    });
+    const sub2 = player.addListener('statusChange', (p: any) => {
+      if (p?.error) {
+        console.log('[PLAYER] ERROR', p.error);
+        const errorMsg = `Error de reproducción (intento ${retryCount + 1})`;
+        if (retryCount < 3) {
+          setRetryCount(prev => prev + 1);
+          setLoading(true);
+          if (player) player.replace(url);
+        } else {
+          setError(errorMsg + '. Presiona Reintentar.');
+        }
+        setLoading(false);
+      }
+    });
+    return () => {
+      sub1.remove();
+      sub2.remove();
+    };
+  }, [player, retryCount, url]);
+
+  useEffect(() => {
+    if (!player) return;
+    const interval = setInterval(() => {
+      if (!player) return;
+      const ct = player.currentTime || 0;
+      const dur = (player as any).duration || 0;
+      setCurrentTime(ct);
+      setDuration(dur);
+    }, 200);
+    return () => clearInterval(interval);
+  }, [player]);
+
+  const formatTime = (secs: number) => {
+    if (!secs || isNaN(secs)) return '0:00';
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = Math.floor(secs % 60);
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    return `${m}:${String(s).padStart(2, '0')}`;
+  };
+
+  const progress = duration > 0 ? currentTime / duration : 0;
+
+  useEffect(() => {
+    lockLandscape();
+    return () => {};
+  }, []);
+
+  // Si hay error, mostrar pantalla de error
+  if (error) {
+    return (
+      <Modal visible animationType="fade" statusBarTranslucent onRequestClose={handleClose}>
+        <View style={stylesTV.modalFullscreen}>
+          <View style={stylesTV.modalError}>
+            <Ionicons name="alert-circle-outline" size={rs(80)} color="#ff1744" />
+            <Text style={stylesTV.errorText}>{error}</Text>
+            <Focusable style={[stylesTV.resumeBtn, stylesTV.resumeBtnPrimary, { marginTop: 20 }]} onPress={handleRetry}>
+              <Text style={stylesTV.resumeBtnText}>Reintentar</Text>
+            </Focusable>
+          </View>
+        </View>
+      </Modal>
+    );
+  }
+
+  // --- MODO WEBVIEW ---
+  if (useWebView) {
+    return (
+      <Modal visible animationType="fade" statusBarTranslucent onRequestClose={handleClose}>
+        <View style={{ flex: 1, backgroundColor: '#000' }}>
+          <WebViewPlayer
+            url={url}
+            onClose={toggleWebView}
+            title={title}
+            fullscreen={true}
+          />
+          <TouchableOpacity
+            style={{ position: 'absolute', top: 40, right: 20, zIndex: 10 }}
+            onPress={toggleWebView}
+          >
+            <Ionicons name="close" size={40} color="#fff" />
+          </TouchableOpacity>
+        </View>
+      </Modal>
+    );
+  }
+
+  // --- MODO REPRODUCTOR NATIVO ---
+  return (
+    <Modal visible animationType="fade" statusBarTranslucent onRequestClose={handleClose}>
+      <View style={stylesTV.modalFullscreen}>
+        {loading && (
+          <View style={stylesTV.modalLoading}>
+            <ActivityIndicator size="large" color="#ff1744" />
+            <Text style={stylesTV.loadingText}>Cargando...</Text>
+          </View>
+        )}
+        <VideoView style={StyleSheet.absoluteFill} player={player} contentFit="fill" nativeControls={false} onTouchStart={showControls} />
+
+        {showNextBanner && nextEpisode && (
+          <View style={stylesTV.nextEpisodeBanner}>
+            <LinearGradient colors={['rgba(0,0,0,0.85)', 'rgba(0,0,0,0.5)']} style={StyleSheet.absoluteFill} />
+            <View style={stylesTV.nextEpisodeContent}>
+              <Text style={stylesTV.nextEpisodeTitle}>⏭️ Siguiente episodio</Text>
+              <Text style={stylesTV.nextEpisodeName}>{nextEpisode.title || `Episodio ${nextEpisode.code}`}</Text>
+              <Text style={stylesTV.nextEpisodeCountdown}>Auto-reproducción en {countdown}s</Text>
+              <View style={stylesTV.nextEpisodeActions}>
+                <Focusable style={[stylesTV.resumeBtn, stylesTV.resumeBtnPrimary]} onPress={handleNextEpisode}>
+                  <Ionicons name="play-forward" size={rs(28)} color="#fff" />
+                  <Text style={stylesTV.resumeBtnText}>Reproducir ahora</Text>
+                </Focusable>
+                <Focusable style={[stylesTV.resumeBtn, stylesTV.resumeBtnSecondary]} onPress={cancelAutoNext}>
+                  <Ionicons name="close" size={rs(28)} color="#fff" />
+                  <Text style={stylesTV.resumeBtnText}>Cancelar</Text>
+                </Focusable>
+              </View>
+            </View>
+          </View>
+        )}
+
+        <Animated.View style={[stylesTV.modalControls, { opacity: controlsAnim }]} pointerEvents={controlsVisible ? 'box-none' : 'none'}>
+          <LinearGradient colors={['rgba(0,0,0,0.8)', 'transparent', 'rgba(0,0,0,0.8)']} style={StyleSheet.absoluteFill} pointerEvents="none" />
+          <View style={stylesTV.modalControlTop}>
+            <Text style={stylesTV.playerTitle} numberOfLines={1}>{title || 'Reproduciendo'}</Text>
+            <View style={{ flexDirection: 'row' }}>
+              {/* BOTÓN PARA CAMBIAR A WEBVIEW */}
+              <Focusable onPress={toggleWebView} style={stylesTV.sourceBtn}>
+                <Ionicons name="globe-outline" size={rs(34)} color="#fff" />
+              </Focusable>
+              {hasTrackOptions && (
+                <Focusable onPress={() => setTracksModalVisible(true)} style={stylesTV.sourceBtn}>
+                  <Ionicons name="language-outline" size={rs(34)} color="#fff" />
+                </Focusable>
+              )}
+              {sourceOptions.length > 1 && (
+                <Focusable onPress={() => setSourceModalVisible(true)} style={stylesTV.sourceBtn}>
+                  <Ionicons name="radio-outline" size={rs(34)} color="#fff" />
+                </Focusable>
+              )}
+            </View>
+          </View>
+          <View style={stylesTV.modalControlCenter}>
+            <Focusable style={stylesTV.controlBtn} onPress={() => seek(-10)}>
+              <Ionicons name="play-back" size={rs(44)} color="#fff" />
+              <Text style={stylesTV.controlLabel}>10</Text>
+            </Focusable>
+            <Focusable style={stylesTV.modalPlayBtn} onPress={togglePlay}>
+              <LinearGradient colors={['#ff1744', '#d50000']} style={stylesTV.modalPlayGradient}>
+                <Ionicons name={isPlaying ? 'pause' : 'play'} size={rs(56)} color="#fff" />
+              </LinearGradient>
+            </Focusable>
+            <Focusable style={stylesTV.controlBtn} onPress={() => seek(10)}>
+              <Ionicons name="play-forward" size={rs(44)} color="#fff" />
+              <Text style={stylesTV.controlLabel}>10</Text>
+            </Focusable>
+          </View>
+          {duration > 0 && (
+            <View style={stylesTV.modalControlBottom}>
+              <Text style={stylesTV.timeText}>{formatTime(currentTime)}</Text>
+              <View style={stylesTV.progressTrack} ref={progressTrackRef}>
+                <View style={stylesTV.progressBg} />
+                <View style={[stylesTV.progressFill, { width: `${progress * 100}%`, backgroundColor: '#ff1744' }]} />
+                <View style={[stylesTV.progressThumb, { left: `${progress * 100}%` }]} />
+                <TouchableOpacity style={StyleSheet.absoluteFill} activeOpacity={0.9} onPress={handleSeekBarPress} />
+              </View>
+              <Text style={stylesTV.timeText}>{formatTime(duration)}</Text>
+            </View>
+          )}
+        </Animated.View>
+        <SourceSelectorModal visible={sourceModalVisible} options={sourceOptions} selectedIndex={selectedSourceIndex} onSelect={onSelectSource} onClose={() => setSourceModalVisible(false)} />
+        <TracksSelectorModal
+          visible={tracksModalVisible}
+          onClose={() => setTracksModalVisible(false)}
+          audioTracks={availableAudioTracks || []}
+          subtitleTracks={availableSubtitleTracks || []}
+          currentAudioTrack={audioTrack}
+          currentSubtitleTrack={subtitleTrack}
+          onSelectAudio={handleSelectAudioTrack}
+          onSelectSubtitle={handleSelectSubtitleTrack}
+        />
+      </View>
+    </Modal>
+  );
+});
+
+// ============================================================
+// COMPONENTES DE GRID (Películas y Series)
+// ============================================================
+const MoviesGrid = memo(({ items, loading, onRefresh, onPlay }: any) => {
+  const [busqueda, setBusqueda] = useState('');
+  const filtered = items.filter((i: MediaItem) => i.title.toLowerCase().includes(busqueda.toLowerCase()));
+
+  const renderMovie = ({ item, index }: { item: MediaItem; index: number }) => (
+    <Focusable style={stylesTV.gridItem} onPress={() => onPlay(item)} tvParallaxProperties={{ enabled: true, shiftDistanceX: 15, shiftDistanceY: 15, tiltAngle: 0.1, magnification: 1.1 }} hasTVPreferredFocus={index === 0}>
+      <View style={stylesTV.gridPosterContainer}>
+        <Image source={{ uri: item.poster }} style={stylesTV.gridPoster} />
+        {item.rating && (
+          <View style={stylesTV.gridRating}>
+            <Ionicons name="star" size={rs(18)} color="#F5C842" />
+            <Text style={stylesTV.gridRatingText}>{item.rating}</Text>
+          </View>
+        )}
+      </View>
+      <Text style={stylesTV.gridTitle} numberOfLines={2}>{item.title}</Text>
+      {item.year && <Text style={stylesTV.gridYear}>{item.year}</Text>}
+    </Focusable>
+  );
+
+  return (
+    <View style={stylesTV.gridContainer}>
+      <View style={stylesTV.gridSearch}>
+        <Ionicons name="search" size={rs(32)} color="rgba(255,255,255,0.5)" />
+        <TextInput style={stylesTV.gridSearchInput} placeholder="Buscar películas..." placeholderTextColor="rgba(255,255,255,0.4)" value={busqueda} onChangeText={setBusqueda} />
+      </View>
+      {loading ? (
+        <View style={stylesTV.centerLoading}>
+          <ActivityIndicator size="large" color="#ff1744" />
+          <Text style={stylesTV.loadingText}>Cargando películas...</Text>
+        </View>
+      ) : (
+        <FlatList
+          data={filtered}
+          keyExtractor={(i: MediaItem) => i.id}
+          numColumns={getGridColumns()}
+          renderItem={renderMovie}
+          refreshControl={<RefreshControl refreshing={loading} onRefresh={onRefresh} tintColor="#ff1744" colors={['#ff1744']} />}
+          contentContainerStyle={{ paddingBottom: rs(40), justifyContent: 'space-between' }}
+          showsVerticalScrollIndicator={false}
+        />
+      )}
+    </View>
+  );
+});
+
+const SeriesGrid = memo(({ shows, loading, onRefresh, onSelectShow, title }: any) => {
+  const [busqueda, setBusqueda] = useState('');
+  const filtered = shows.filter((s: PlexShow) => s.title.toLowerCase().includes(busqueda.toLowerCase()));
+
+  const renderShow = ({ item, index }: { item: PlexShow; index: number }) => (
+    <Focusable style={stylesTV.gridItem} onPress={() => onSelectShow(item)} tvParallaxProperties={{ enabled: true, shiftDistanceX: 15, shiftDistanceY: 15, tiltAngle: 0.1, magnification: 1.1 }} hasTVPreferredFocus={index === 0}>
+      <View style={stylesTV.gridPosterContainer}>
+        <Image source={{ uri: item.poster }} style={stylesTV.gridPoster} />
+        {item.rating && (
+          <View style={stylesTV.gridRating}>
+            <Ionicons name="star" size={rs(18)} color="#F5C842" />
+            <Text style={stylesTV.gridRatingText}>{item.rating}</Text>
+          </View>
+        )}
+      </View>
+      <Text style={stylesTV.gridTitle} numberOfLines={2}>{item.title}</Text>
+      {item.year && <Text style={stylesTV.gridYear}>{item.year}</Text>}
+    </Focusable>
+  );
+
+  return (
+    <View style={stylesTV.gridContainer}>
+      <Text style={stylesTV.gridSectionTitle}>{title || 'Series'}</Text>
+      <View style={stylesTV.gridSearch}>
+        <Ionicons name="search" size={rs(32)} color="rgba(255,255,255,0.5)" />
+        <TextInput style={stylesTV.gridSearchInput} placeholder="Buscar series..." placeholderTextColor="rgba(255,255,255,0.4)" value={busqueda} onChangeText={setBusqueda} />
+      </View>
+      {loading ? (
+        <View style={stylesTV.centerLoading}>
+          <ActivityIndicator size="large" color="#ff1744" />
+          <Text style={stylesTV.loadingText}>Cargando series...</Text>
+        </View>
+      ) : (
+        <FlatList
+          data={filtered}
+          keyExtractor={(item: PlexShow) => item.id}
+          numColumns={getGridColumns()}
+          renderItem={renderShow}
+          refreshControl={<RefreshControl refreshing={loading} onRefresh={onRefresh} tintColor="#ff1744" colors={['#ff1744']} />}
+          contentContainerStyle={{ paddingBottom: rs(40), justifyContent: 'space-between' }}
+          showsVerticalScrollIndicator={false}
+        />
+      )}
+    </View>
+  );
+});
+
+// ============================================================
+// DETALLE DE SERIE MEJORADO CON PESTAÑAS POR TEMPORADA
+// ============================================================
+const SeriesDetail = memo(({
+  show,
+  onBack,
+  onPlayEpisode,
+  continueWatchingItems = [],
+  onPlayNextEpisode
+}: {
+  show: PlexShow;
+  onBack: () => void;
+  onPlayEpisode: (ep: PlexEpisode) => void;
+  continueWatchingItems?: ContinueWatchingItem[];
+  onPlayNextEpisode?: (ep: PlexEpisode) => void;
+}) => {
+  const [selectedSeasonIndex, setSelectedSeasonIndex] = useState(0);
+  const seasons = show.seasons || [];
+
+  // Obtener el próximo episodio no visto (global)
+  const getNextEpisode = useCallback(() => {
+    const allEpisodes = seasons.flatMap(s => s.episodes);
+    const watchedIds = new Set(
+      continueWatchingItems
+        .filter(item => item.showId === show.id && item.progress > 0)
+        .map(item => item.id)
+    );
+    return allEpisodes.find(ep => !watchedIds.has(ep.id));
+  }, [show, continueWatchingItems, seasons]);
+
+  const nextEpisode = getNextEpisode();
+
+  // Episodios de la temporada seleccionada
+  const currentSeason = seasons[selectedSeasonIndex];
+  const episodes = currentSeason?.episodes || [];
+
+  const renderEpisode = ({ item: ep, index }: { item: PlexEpisode; index: number }) => {
+    const watchedItem = continueWatchingItems.find(
+      item => item.id === ep.id && item.showId === show.id
+    );
+    const progress = watchedItem ? (watchedItem.progress / watchedItem.duration) * 100 : 0;
+    const isWatched = progress > 90;
+
+    return (
+      <Focusable
+        style={stylesTV.detailEpisodeRow}
+        onPress={() => onPlayEpisode(ep)}
+        hasTVPreferredFocus={index === 0 && selectedSeasonIndex === 0}
+      >
+        <View style={stylesTV.detailEpisodeCodeBox}>
+          <Text style={stylesTV.detailEpisodeCode}>{ep.code}</Text>
+        </View>
+        <Text style={[stylesTV.detailEpisodeTitle, isWatched && { color: 'rgba(255,255,255,0.4)' }]} numberOfLines={1}>
+          {ep.title}
+        </Text>
+        {isWatched ? (
+          <Ionicons name="checkmark-circle" size={rs(30)} color="#4CAF50" />
+        ) : progress > 0 ? (
+          <View style={{ width: rs(60), height: rs(6), backgroundColor: 'rgba(255,255,255,0.2)', borderRadius: 3, marginHorizontal: 8 }}>
+            <View style={{ width: `${Math.min(progress, 100)}%`, height: '100%', backgroundColor: '#ff1744', borderRadius: 3 }} />
+          </View>
+        ) : (
+          <Ionicons name="play-circle-outline" size={rs(34)} color="rgba(255,255,255,0.6)" />
+        )}
+      </Focusable>
+    );
+  };
+
+  return (
+    <View style={stylesTV.gridContainer}>
+      <Focusable style={stylesTV.detailBackBtn} onPress={onBack}>
+        <Ionicons name="chevron-back" size={rs(34)} color="#fff" />
+        <Text style={stylesTV.detailBackText} numberOfLines={1}>{show.title}</Text>
+      </Focusable>
+
+      {show.overview ? (
+        <Text style={stylesTV.detailOverview} numberOfLines={3}>{show.overview}</Text>
+      ) : null}
+
+      {nextEpisode && onPlayNextEpisode && (
+        <Focusable
+          style={[stylesTV.resumeBtn, stylesTV.resumeBtnPrimary, { marginBottom: 20, alignSelf: 'center' }]}
+          onPress={() => onPlayNextEpisode(nextEpisode)}
+        >
+          <Ionicons name="play-forward" size={rs(28)} color="#fff" />
+          <Text style={stylesTV.resumeBtnText}>Siguiente episodio: {nextEpisode.code}</Text>
+        </Focusable>
+      )}
+
+      {/* PESTAÑAS DE TEMPORADAS */}
+      {seasons.length > 1 && (
+        <View style={stylesTV.seasonTabsContainer}>
+          {seasons.map((season, idx) => (
+            <Focusable
+              key={season.number}
+              style={[stylesTV.seasonTab, selectedSeasonIndex === idx && stylesTV.seasonTabActive]}
+              onPress={() => setSelectedSeasonIndex(idx)}
+              hasTVPreferredFocus={idx === 0}
+            >
+              <Text style={[stylesTV.seasonTabText, selectedSeasonIndex === idx && stylesTV.seasonTabTextActive]}>
+                {season.label || `Temporada ${season.number}`}
+              </Text>
+              {selectedSeasonIndex === idx && <View style={stylesTV.seasonTabIndicator} />}
+            </Focusable>
+          ))}
+        </View>
+      )}
+
+      {/* EPISODIOS DE LA TEMPORADA SELECCIONADA */}
+      {episodes.length === 0 ? (
+        <View style={stylesTV.centerLoading}>
+          <Text style={stylesTV.loadingText}>No hay episodios en esta temporada.</Text>
+        </View>
+      ) : (
+        <FlatList
+          data={episodes}
+          keyExtractor={(ep, idx) => ep.id || `ep-${idx}`}
+          renderItem={renderEpisode}
+          contentContainerStyle={{ paddingBottom: rs(40) }}
+          showsVerticalScrollIndicator={false}
+        />
+      )}
+    </View>
+  );
+});
+
+// ============================================================
+// MODAL DE ACTIVACIÓN
+// ============================================================
+interface ActivationModalProps {
+  visible: boolean;
+  onClose: () => void;
+  onActivateSuccess: () => void;
+  mode?: 'expired' | 'voluntary' | 'renew';
+  deviceId?: string;
+}
+
+const ActivationModal = memo(({ visible, onClose, onActivateSuccess, mode = 'voluntary', deviceId = '' }: ActivationModalProps) => {
+  const [code, setCode] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleActivate = async () => {
+    if (!code.trim()) {
+      setError('Ingresa un código de activación');
+      return;
+    }
+    setLoading(true);
+    setError('');
+    const result = await activateWithCode(code.trim());
+    setLoading(false);
+    if (result.success) {
+      Alert.alert('¡Éxito!', 'Tu suscripción ha sido activada correctamente.');
+      onActivateSuccess();
+    } else {
+      setError(result.error || 'Código inválido');
+    }
+  };
+
+  const openPaymentLink = () => {
+    Linking.openURL(PAYMENT_URL).catch(() => Alert.alert('Error', 'No se pudo abrir el enlace de pago'));
+  };
+
+  const isExpired = mode === 'expired';
+  const isRenew = mode === 'renew';
+
+  return (
+    <Modal transparent visible={visible} animationType="fade" onRequestClose={onClose}>
+      <TouchableOpacity style={stylesTV.sourceModalOverlay} activeOpacity={1} onPress={onClose}>
+        <View style={stylesTV.trialExpiredContent}>
+          <Ionicons name={isExpired ? "lock-closed" : "key-outline"} size={rs(80)} color={isExpired ? "#ff1744" : "#4CAF50"} />
+          <Text style={[stylesTV.trialExpiredTitle, { color: isExpired ? '#ff1744' : (isRenew ? '#FF9800' : '#4CAF50') }]}>
+            {isExpired ? 'Prueba gratuita finalizada' : isRenew ? 'Renovar suscripción' : 'Activar dispositivo'}
+          </Text>
+          <Text style={stylesTV.trialExpiredSubtitle}>
+            {isExpired
+              ? 'El periodo de prueba finalizo. Para seguir disfrutando de NEXUS TV, adquiere tu suscripción.'
+              : isRenew
+              ? 'Tu suscripción está por expirar. Ingresa un nuevo código para extenderla 30 días más.'
+              : 'Si ya has adquirido tu suscripción, ingresa el código de activación que recibiste.'}
+          </Text>
+          {/* Mostrar ID del dispositivo */}
+          <Text style={[stylesTV.trialExpiredSubtitle, { color: 'rgba(255,255,255,0.5)', fontSize: rs(16), marginTop: 4 }]}>
+            ID del dispositivo: {deviceId || 'No disponible'}
+          </Text>
+          <View style={stylesTV.trialExpiredActions}>
+            {isExpired && (
+              <Focusable style={[stylesTV.resumeBtn, stylesTV.resumeBtnPrimary]} onPress={openPaymentLink}>
+                <Ionicons name="card-outline" size={rs(28)} color="#fff" />
+                <Text style={stylesTV.resumeBtnText}>Comprar suscripción</Text>
+              </Focusable>
+            )}
+            {(isRenew) && (
+              <Focusable style={[stylesTV.resumeBtn, { backgroundColor: '#FF9800', borderColor: '#FF9800' }]} onPress={openPaymentLink}>
+                <Ionicons name="card-outline" size={rs(28)} color="#fff" />
+                <Text style={stylesTV.resumeBtnText}>Renovar ahora</Text>
+              </Focusable>
+            )}
+            <View style={stylesTV.trialActivationForm}>
+              <Text style={stylesTV.trialActivationLabel}>
+                {isExpired ? '¿Ya tienes un código?' : (isRenew ? 'Ingresa tu nuevo código' : 'Código de activación')}
+              </Text>
+              <TextInput
+                style={stylesTV.trialActivationInput}
+                placeholder="Código de activación"
+                placeholderTextColor="rgba(255,255,255,0.4)"
+                value={code}
+                onChangeText={setCode}
+                onSubmitEditing={handleActivate}
+                autoFocus={!isTV}
+              />
+              {error ? <Text style={stylesTV.trialError}>{error}</Text> : null}
+              <Focusable style={[stylesTV.resumeBtn, stylesTV.resumeBtnPrimary]} onPress={handleActivate}>
+                {loading ? (
+                  <ActivityIndicator color="#fff" size="small" />
+                ) : (
+                  <>
+                    <Ionicons name="checkmark-circle-outline" size={rs(28)} color="#fff" />
+                    <Text style={stylesTV.resumeBtnText}>
+                      {isExpired ? 'Activar' : (isRenew ? 'Renovar' : 'Activar')}
+                    </Text>
+                  </>
+                )}
+              </Focusable>
+              {!isExpired && (
+                <Focusable style={[stylesTV.resumeBtn, stylesTV.resumeBtnSecondary, { marginTop: 8 }]} onPress={onClose}>
+                  <Text style={stylesTV.resumeBtnText}>Cancelar</Text>
+                </Focusable>
+              )}
+            </View>
+          </View>
+        </View>
+      </TouchableOpacity>
+    </Modal>
+  );
+});
+
+// ============================================================
+// COMPONENTE PRINCIPAL AppTV
+// ============================================================
+export default function AppTV() {
+  const [selectedMenu, setSelectedMenu] = useState('TV');
+  const [listaCanales, setListaCanales] = useState<Canal[]>([]);
+  const [loadingChannels, setLoadingChannels] = useState(true);
+  const [currentChannel, setCurrentChannel] = useState<Canal | null>(null);
+  const [currentUrl, setCurrentUrl] = useState<string | null>(null);
+  const [favorites, setFavorites] = useState<string[]>([]);
+  const [isLiveFullscreen, setIsLiveFullscreen] = useState(false);
+  const [showChannelOverlay, setShowChannelOverlay] = useState(false);
+  const [driveMovies, setDriveMovies] = useState<MediaItem[]>([]);
+  const [loadingDrive, setLoadingDrive] = useState(false);
+  const [plexShows, setPlexShows] = useState<PlexShow[]>([]);
+  const [loadingPlex, setLoadingPlex] = useState(false);
+  const [animeShows, setAnimeShows] = useState<PlexShow[]>([]);
+  const [loadingAnime, setLoadingAnime] = useState(false);
+  const [doramasShows, setDoramasShows] = useState<PlexShow[]>([]);
+  const [loadingDoramas, setLoadingDoramas] = useState(false);
+  const [selectedShow, setSelectedShow] = useState<PlexShow | null>(null);
+  const [viewMode, setViewMode] = useState<'grid' | 'detail'>('grid');
+  const [continueWatchingItems, setContinueWatchingItems] = useState<ContinueWatchingItem[]>([]);
+  const [profiles, setProfiles] = useState<Profile[]>([]);
+  const [currentProfileId, setCurrentProfileId] = useState<string | null>(null);
+  const [showProfileScreen, setShowProfileScreen] = useState(true);
+  const [searchVisible, setSearchVisible] = useState(false);
+  const [playerVisible, setPlayerVisible] = useState(false);
+  const [playerUrl, setPlayerUrl] = useState<string | null>(null);
+  const [playerTitle, setPlayerTitle] = useState<string>('');
+  const [playerId, setPlayerId] = useState<string>('');
+  const [playerPoster, setPlayerPoster] = useState<string>('');
+  const [playerType, setPlayerType] = useState<string>('movie');
+  const [playerShowId, setPlayerShowId] = useState<string>('');
+  const [playerShowName, setPlayerShowName] = useState<string>('');
+  const [playerEpisodeCode, setPlayerEpisodeCode] = useState<string>('');
+  const [playerInitialTime, setPlayerInitialTime] = useState<number>(0);
+  const [playerAudioStreams, setPlayerAudioStreams] = useState<PlexStreamInfo[]>([]);
+  const [playerSubtitleStreams, setPlayerSubtitleStreams] = useState<PlexStreamInfo[]>([]);
+  const [sourceOptions, setSourceOptions] = useState<{ label: string; url: string }[]>([]);
+  const [selectedSourceIndex, setSelectedSourceIndex] = useState<number>(0);
+  const [resumeDialogVisible, setResumeDialogVisible] = useState(false);
+  const [resumeItem, setResumeItem] = useState<ContinueWatchingItem | null>(null);
+  const [nextEpisodeData, setNextEpisodeData] = useState<any>(null);
+  const [currentEpisodeIndex, setCurrentEpisodeIndex] = useState<number>(-1);
+  const [fuentesRemotas, setFuentesRemotas] = useState<Map<string, { label: string; url: string }[]>>(new Map());
+  const [accessValid, setAccessValid] = useState<boolean | null>(null);
+  const [accessDaysLeft, setAccessDaysLeft] = useState<number | undefined>(undefined);
+  const [accessExpired, setAccessExpired] = useState<boolean>(false);
+  const [isActivated, setIsActivated] = useState<boolean>(false);
+  const [checkingAccess, setCheckingAccess] = useState(true);
+  const [activationModalVisible, setActivationModalVisible] = useState(false);
+  const [activationModalMode, setActivationModalMode] = useState<'expired' | 'voluntary' | 'renew'>('voluntary');
+  // ID del dispositivo
+  const [deviceId, setDeviceId] = useState<string>('');
+
+  const driveMoviesLoaded = useRef(false);
+  const plexLoaded = useRef(false);
+  const animeLoaded = useRef(false);
+  const doramasLoaded = useRef(false);
+
+  useKeepAwake();
+
+  useEffect(() => {
+    lockLandscape();
+  }, []);
+
+  // ===== FUNCIÓN PARA CARGAR CANALES DESDE EL SERVIDOR =====
+  const cargarCanalesDesdeServidor = useCallback(async (mostrarAlerta: boolean = false) => {
+    try {
+      console.log('[CANALES] Cargando canales remotos...');
+      const response = await fetch(`${API_BASE_URL}/get_channels.php`);
+      const data = await response.json();
+      if (data.success && data.canales) {
+        const canalesFormateados: Canal[] = data.canales.map((c: any) => ({
+          id: `remote-${c.id}`,
+          numero: c.numero || c.id,
+          name: c.nombre,
+          logo: c.logo || '',
+          category: c.categoria || 'General',
+          nowPlaying: c.now_playing || '',
+          slug: c.slug,
+          url: '',
+          embedSlug: c.slug,
+          isRemote: true,
+        }));
+        const fuentesMap = new Map();
+        data.canales.forEach((c: any) => {
+          if (c.fuentes && c.fuentes.length > 0) {
+            fuentesMap.set(`remote-${c.id}`, c.fuentes.map((f: any) => ({ label: f.label, url: f.url })));
+          }
+        });
+        setFuentesRemotas(fuentesMap);
+        setListaCanales([...canalesFormateados, ...CANALES_MANUALES]);
+        if (mostrarAlerta) {
+          Alert.alert('Canales actualizados', `Se cargaron ${canalesFormateados.length} canales desde el servidor.`);
+        }
+        return canalesFormateados;
+      } else {
+        setListaCanales(CANALES_MANUALES);
+        if (mostrarAlerta) {
+          Alert.alert('Error', 'No se pudieron cargar los canales remotos. Usando lista local.');
+        }
+        return [];
+      }
+    } catch (e) {
+      console.log('[CANALES] Error cargando canales remotos', e);
+      setListaCanales(CANALES_MANUALES);
+      if (mostrarAlerta) {
+        Alert.alert('Error', 'Error de conexión al cargar canales. Usando lista local.');
+      }
+      return [];
+    }
+  }, []);
+
+  // === FUNCIÓN DE SINCRONIZACIÓN ===
+  const syncRemoteStatus = useCallback(async () => {
+    try {
+      const deviceId = await getDeviceId();
+      console.log('[SYNC] Consultando estado para:', deviceId);
+
+      const response = await fetch(`${API_BASE_URL}/check_device.php`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deviceId }),
+      });
+      const result = await response.json();
+      console.log('[SYNC] Respuesta del servidor:', result);
+
+      if (!result.success) {
+        console.log('[SYNC] El servidor respondió con un error.');
+        return;
+      }
+
+      const remoteStatus = result.status ? result.status.toString().toLowerCase().trim() : 'unknown';
+      const remoteExpiration = result.expiration_date ? parseInt(result.expiration_date) : 0;
+      const now = Date.now();
+      const remoteExpirationMs = remoteExpiration * 1000;
+
+      console.log('[SYNC] Estado normalizado:', remoteStatus, 'Expiración (ms):', remoteExpirationMs);
+
+      // Caso 1: Suspendido, expirado o activo pero vencido
+      if (remoteStatus === 'blocked' || remoteStatus === 'expired' || (remoteStatus === 'activated' && remoteExpirationMs < now)) {
+        await AsyncStorage.removeItem(ACTIVATION_KEY);
+        await AsyncStorage.removeItem(TRIAL_KEY);
+        await AsyncStorage.setItem(REVOKED_KEY, 'true');
+
+        const newStatus = await checkAccessStatus();
+        setAccessValid(newStatus.valid);
+        setAccessDaysLeft(newStatus.daysLeft);
+        setAccessExpired(newStatus.expired);
+        setIsActivated(newStatus.isActivated);
+
+        if (!newStatus.valid) {
+          console.log('[SYNC] Acceso denegado: suscripción revocada o expirada.');
+        }
+        return;
+      }
+
+      // Caso 2: Activo y vigente
+      if (remoteStatus === 'activated' && remoteExpirationMs > now) {
+        await AsyncStorage.removeItem(REVOKED_KEY);
+
+        const activationRaw = await AsyncStorage.getItem(ACTIVATION_KEY);
+        let currentExpiration = null;
+        if (activationRaw) {
+          try {
+            const activation = JSON.parse(activationRaw);
+            currentExpiration = activation.expirationDate;
+          } catch (e) {
+            console.log('[SYNC] Error al parsear activation:', e);
+          }
+        }
+
+        if (currentExpiration !== remoteExpirationMs) {
+          const newActivation: ActivationData = {
+            code: 'sync',
+            expirationDate: remoteExpirationMs,
+          };
+          await AsyncStorage.setItem(ACTIVATION_KEY, JSON.stringify(newActivation));
+
+          const newStatus = await checkAccessStatus();
+          setAccessValid(newStatus.valid);
+          setAccessDaysLeft(newStatus.daysLeft);
+          setAccessExpired(newStatus.expired);
+          setIsActivated(newStatus.isActivated);
+
+          console.log('[SYNC] Suscripción actualizada correctamente.');
+        } else {
+          console.log('[SYNC] El estado ya está actualizado.');
+        }
+        return;
+      }
+
+      // Caso 3: Otro estado (desconocido, trial, etc.)
+      console.log('[SYNC] Estado actual:', remoteStatus);
+    } catch (e) {
+      console.error('[SYNC] Error:', e);
+    }
+  }, []);
+
+  // ---- CARGAS CON PLEX ----
+  const cargarPeliculas = useCallback(async (force = false) => {
+    if (force) driveMoviesLoaded.current = false;
+    if (loadingDrive || driveMoviesLoaded.current) return;
+    setLoadingDrive(true);
+    try {
+      const items = await cargarPeliculasPlex();
+      setDriveMovies(items);
+      driveMoviesLoaded.current = true;
+    } catch (e) {
+      console.log('[MOVIES] ERROR', e);
+    } finally {
+      setLoadingDrive(false);
+    }
+  }, [loadingDrive]);
+
+  const cargarSeries = useCallback(async (force = false) => {
+    if (force) plexLoaded.current = false;
+    if (loadingPlex || plexLoaded.current) return;
+    setLoadingPlex(true);
+    try {
+      const shows = await cargarSeriesPlexLocal('Series');
+      setPlexShows(shows);
+      plexLoaded.current = true;
+    } catch (e) {
+      console.log('[SERIES] ERROR', e);
+    } finally {
+      setLoadingPlex(false);
+    }
+  }, [loadingPlex]);
+
+  const cargarAnimePlex = useCallback(async (force = false) => {
+    if (force) animeLoaded.current = false;
+    if (loadingAnime || animeLoaded.current) return;
+    setLoadingAnime(true);
+    try {
+      const shows = await cargarSeriesPlexLocal('Anime');
+      setAnimeShows(shows);
+      animeLoaded.current = true;
+    } catch (e) {
+      console.log('[ANIME] ERROR', e);
+    } finally {
+      setLoadingAnime(false);
+    }
+  }, [loadingAnime]);
+
+  const cargarDoramasPlex = useCallback(async (force = false) => {
+    if (force) doramasLoaded.current = false;
+    if (loadingDoramas || doramasLoaded.current) return;
+    setLoadingDoramas(true);
+    try {
+      const shows = await cargarSeriesPlexLocal('Dorama');
+      setDoramasShows(shows);
+      doramasLoaded.current = true;
+    } catch (e) {
+      console.log('[DORAMAS] ERROR', e);
+    } finally {
+      setLoadingDoramas(false);
+    }
+  }, [loadingDoramas]);
+
+  // ---- CARGA DE CANALES M3U (fallback) ----
+  const cargarListaM3U = useCallback(async () => {
+    console.log('[M3U] Cargando lista...');
+    setLoadingChannels(true);
+    try {
+      const res = await fetch(`${M3U_URL}?t=${Date.now()}`, { cache: 'no-store' });
+      const txt = await res.text();
+      const lineas = txt.split('\n');
+      const parsed: Canal[] = [];
+      let info = { name: '', logo: '', category: 'General' };
+      let idx = 20;
+      lineas.forEach(l => {
+        const lim = l.trim();
+        if (lim.startsWith('#EXTINF:')) {
+          const parts = lim.split(',');
+          info.name = parts[parts.length - 1].trim() || 'Canal';
+          info.logo = lim.match(/tvg-logo="([^"]+)"/i)?.[1] ?? '';
+          info.category = lim.match(/group-title="([^"]+)"/i)?.[1] ?? 'General';
+        } else if (lim.startsWith('http')) {
+          let url = convertirMpdAHls(lim);
+          const slug = extractEmbedSlug(url);
+          parsed.push({
+            id: String(3000 + idx),
+            numero: idx++,
+            name: info.name,
+            logo: info.logo,
+            category: info.category,
+            url,
+            ...(slug ? { embedSlug: slug } : {}),
+          });
+          info = { name: '', logo: '', category: 'General' };
+        }
+      });
+      console.log('[M3U] Cargados', parsed.length, 'canales desde playlist remota');
+      setListaCanales(prev => [...prev, ...parsed]);
+      if (parsed.length > 0 && !currentChannel) {
+        const firstChannel = parsed[0];
+        setCurrentChannel(firstChannel);
+        playChannel(firstChannel);
+      }
+    } catch (e) {
+      console.log('[M3U] ERROR', e);
+    } finally {
+      setLoadingChannels(false);
+    }
+  }, []);
+
+  // ---- PERFILES Y CONTINUAR VIENDO ----
+  const loadContinueWatching = useCallback(async () => {
+    const items = await getContinueWatching();
+    setContinueWatchingItems(items);
+  }, []);
+
+  const loadProfiles = useCallback(async () => {
+    const profs = await getProfiles();
+    setProfiles(profs);
+    const activeId = await getCurrentProfileId();
+    if (activeId && profs.some(p => p.id === activeId)) {
+      setCurrentProfileId(activeId);
+      const favs = await getFavorites(activeId);
+      setFavorites(favs);
+      setShowProfileScreen(false);
+    } else if (profs.length > 0) {
+      const first = profs[0];
+      setCurrentProfileId(first.id);
+      await setCurrentProfileId(first.id);
+      const favs = await getFavorites(first.id);
+      setFavorites(favs);
+      setShowProfileScreen(false);
+    } else {
+      setShowProfileScreen(true);
+    }
+  }, []);
+
+  const handleSelectProfile = async (id: string) => {
+    setCurrentProfileId(id);
+    await setCurrentProfileId(id);
+    const favs = await getFavorites(id);
+    setFavorites(favs);
+    await loadContinueWatching();
+    setShowProfileScreen(false);
+  };
+
+  const handleCreateProfile = async (newProfile: Profile) => {
+    const updated = [...profiles, newProfile];
+    setProfiles(updated);
+    await saveProfiles(updated);
+    await handleSelectProfile(newProfile.id);
+  };
+
+  const handleDeleteProfile = async (id: string) => {
+    if (profiles.length <= 1) {
+      Alert.alert('Error', 'Debes tener al menos un perfil.');
+      return;
+    }
+    Alert.alert('Eliminar perfil', `¿Eliminar "${profiles.find(p => p.id === id)?.name}"?`, [
+      { text: 'Cancelar', style: 'cancel' },
+      {
+        text: 'Eliminar',
+        style: 'destructive',
+        onPress: async () => {
+          const updated = profiles.filter(p => p.id !== id);
+          setProfiles(updated);
+          await saveProfiles(updated);
+          if (currentProfileId === id) {
+            const newId = updated[0].id;
+            setCurrentProfileId(newId);
+            await setCurrentProfileId(newId);
+            const favs = await getFavorites(newId);
+            setFavorites(favs);
+            await loadContinueWatching();
+          }
+        },
+      },
+    ]);
+  };
+
+  // ===== REPRODUCCIÓN DE CANALES CON FUENTES REMOTAS Y CADENA DE RESOLUCIÓN =====
+  const playChannel = useCallback(async (channel: Canal) => {
+    console.log('[CHANNEL] Seleccionando', channel.name);
+    setCurrentChannel(channel);
+    setLoadingChannels(true);
+
+    let opts: { label: string; url: string }[] = [];
+
+    // 1. Construir las opciones de fuentes según el tipo de canal
+    if (channel.isRemote || channel.id.startsWith('remote-')) {
+      const fuentes = fuentesRemotas.get(channel.id);
+      if (fuentes && fuentes.length > 0) {
+        opts = fuentes;
+      } else if (channel.slug) {
+        opts = getSourceOptionsForSlug(channel.slug, channel.category);
+      } else {
+        opts = [{ label: 'Directo', url: channel.url || '' }];
+      }
+    } else {
+      if (channel.embedSlug) {
+        opts = getSourceOptionsForSlug(channel.embedSlug, channel.category);
+        if (channel.url && !opts.some(o => o.url === channel.url)) {
+          opts.push({ label: 'Directo', url: channel.url });
+        }
+      } else {
+        opts = [{ label: 'Directo', url: channel.url }];
+      }
+    }
+
+    setSourceOptions(opts);
+
+    // 2. Función para resolver una URL en cadena (solo para URLs que no sean embed ni proxy)
+    const resolveWithChain = async (url: string, maxAttempts: number = 5): Promise<string | null> => {
+      let currentUrl = url;
+      let attempts = 0;
+      while (attempts < maxAttempts) {
+        try {
+          console.log(`[CHAIN] Intento ${attempts + 1} resolviendo:`, currentUrl);
+          const resolved = await resolveSingleSource(currentUrl);
+          console.log(`[CHAIN] Resuelto:`, resolved);
+          // Si es un stream directo, playlist.php, embed o BixPlay, lo devolvemos
+          if (resolved.includes('.m3u8') || resolved.includes('.mpd') || resolved.includes('playlist.php') ||
+              resolved.includes('embed.saohgdasregions.fun/embed/') ||
+              resolved.includes('bixplay.online')) {
+            console.log('[CHAIN] Es un stream directo, playlist, embed o BixPlay, devolviendo.');
+            return resolved;
+          }
+          // Si es stream.php, también lo devolvemos (para WebView)
+          if (resolved.includes('stream.php')) {
+            console.log('[CHAIN] Es stream.php, devolviendo para WebView.');
+            return resolved;
+          }
+          currentUrl = resolved;
+          attempts++;
+        } catch (err) {
+          console.log(`[CHAIN] Error en intento ${attempts + 1}:`, err);
+          if (err.message === 'REDIRECT_TO_TVENVIVO2') {
+            throw err;
+          }
+          return null;
+        }
+      }
+      console.log('[CHAIN] Demasiados intentos, falló.');
+      return null;
+    };
+
+    // 3. Intentar cada fuente en orden
+    let success = false;
+    for (let i = 0; i < opts.length; i++) {
+      const source = opts[i];
+      console.log(`[CHANNEL] Intentando fuente ${i + 1}/${opts.length}: ${source.label}`);
+      try {
+        // Si es un embed o BixPlay, lo usamos directamente sin resolver
+        if (source.url.includes('embed.saohgdasregions.fun/embed/') || source.url.includes('bixplay.online')) {
+          console.log('[CHANNEL] Es un embed o BixPlay, se usará directamente en WebView.');
+          setCurrentUrl(source.url);
+          setSelectedSourceIndex(i);
+          success = true;
+          break;
+        }
+
+        // Si no es embed ni proxy, resolvemos con la cadena
+        const finalUrl = await resolveWithChain(source.url);
+        if (finalUrl) {
+          setCurrentUrl(finalUrl);
+          setSelectedSourceIndex(i);
+          success = true;
+          break;
+        }
+      } catch (err) {
+        if (err.message === 'REDIRECT_TO_TVENVIVO2') {
+          console.log('[CHANNEL] Redirige a tvenvivo2.com, usando WebView con:', source.url);
+          setCurrentUrl(source.url);
+          setSelectedSourceIndex(i);
+          success = true;
+          break;
+        }
+        console.log(`[CHANNEL] Fuente ${source.label} falló:`, err);
+      }
+    }
+
+    if (!success) {
+      Alert.alert('Error', `No se pudo cargar ningún stream para ${channel.name}.`);
+      setCurrentUrl(null);
+    }
+
+    setLoadingChannels(false);
+  }, [fuentesRemotas]);
+
+  // ===== SELECTOR DE FUENTE (cuando el usuario cambia manualmente) =====
+  const selectSource = useCallback(async (index: number) => {
+    if (index < 0 || index >= sourceOptions.length) return;
+    setSelectedSourceIndex(index);
+    setLoadingChannels(true);
+
+    const opts = sourceOptions;
+
+    // Función de resolución en cadena (igual que en playChannel)
+    const resolveWithChain = async (url: string, maxAttempts: number = 5): Promise<string | null> => {
+      let currentUrl = url;
+      let attempts = 0;
+      while (attempts < maxAttempts) {
+        try {
+          console.log(`[SOURCE-CHAIN] Intento ${attempts + 1} resolviendo:`, currentUrl);
+          const resolved = await resolveSingleSource(currentUrl);
+          console.log(`[SOURCE-CHAIN] Resuelto:`, resolved);
+          if (resolved.includes('.m3u8') || resolved.includes('.mpd') || resolved.includes('playlist.php') ||
+              resolved.includes('embed.saohgdasregions.fun/embed/') ||
+              resolved.includes('bixplay.online')) {
+            return resolved;
+          }
+          if (resolved.includes('stream.php')) {
+            return resolved;
+          }
+          currentUrl = resolved;
+          attempts++;
+        } catch (err) {
+          console.log(`[SOURCE-CHAIN] Error en intento ${attempts + 1}:`, err);
+          if (err.message === 'REDIRECT_TO_TVENVIVO2') {
+            throw err;
+          }
+          return null;
+        }
+      }
+      return null;
+    };
+
+    let success = false;
+    // Intentar desde el índice seleccionado, y luego circular
+    for (let i = 0; i < opts.length; i++) {
+      const idx = (index + i) % opts.length;
+      const source = opts[idx];
+      try {
+        // Si es un embed o BixPlay, lo usamos directamente
+        if (source.url.includes('embed.saohgdasregions.fun/embed/') || source.url.includes('bixplay.online')) {
+          console.log('[SOURCE] Es un embed o BixPlay, se usará directamente en WebView.');
+          setCurrentUrl(source.url);
+          setSelectedSourceIndex(idx);
+          success = true;
+          break;
+        }
+        const finalUrl = await resolveWithChain(source.url);
+        if (finalUrl) {
+          setCurrentUrl(finalUrl);
+          setSelectedSourceIndex(idx);
+          success = true;
+          break;
+        }
+      } catch (err) {
+        if (err.message === 'REDIRECT_TO_TVENVIVO2') {
+          console.log('[SOURCE] Redirige a tvenvivo2.com, usando WebView con:', source.url);
+          setCurrentUrl(source.url);
+          setSelectedSourceIndex(idx);
+          success = true;
+          break;
+        }
+        console.log(`[SOURCE] Fuente ${source.label} falló:`, err);
+      }
+    }
+
+    if (!success) {
+      Alert.alert('Error', 'No se pudo cargar ninguna fuente disponible.');
+      setCurrentUrl(null);
+    }
+    setLoadingChannels(false);
+  }, [sourceOptions]);
+
+  // ---- FUNCIONES PARA ABRIR REPRODUCTOR CON SOPORTE PARA SIGUIENTE EPISODIO ----
+  const openPlayer = (
+    item: any,
+    type: string,
+    title: string,
+    url: string,
+    poster: string,
+    showId?: string,
+    showName?: string,
+    episodeCode?: string,
+    initialTime = 0,
+    audioStreams: PlexStreamInfo[] = [],
+    subtitleStreams: PlexStreamInfo[] = []
+  ) => {
+    if (!url) {
+      Alert.alert('Error', `No se encontró un archivo reproducible para "${title}".`);
+      return;
+    }
+    setPlayerTitle(title);
+    setPlayerUrl(url);
+    setPlayerId(item.id || item.driveFileId || `temp-${Date.now()}`);
+    setPlayerPoster(poster);
+    setPlayerType(type);
+    setPlayerShowId(showId || '');
+    setPlayerShowName(showName || '');
+    setPlayerEpisodeCode(episodeCode || '');
+    setPlayerInitialTime(initialTime);
+    setPlayerAudioStreams(audioStreams || item.audioStreams || []);
+    setPlayerSubtitleStreams(subtitleStreams || item.subtitleStreams || []);
+    setSourceOptions([]);
+    setSelectedSourceIndex(0);
+
+    if (showId && type === 'episode') {
+      const show = [...plexShows, ...animeShows, ...doramasShows].find(s => s.id === showId);
+      if (show) {
+        const allEpisodes = show.seasons.flatMap(s => s.episodes);
+        const currentIdx = allEpisodes.findIndex(ep => ep.id === item.id);
+        if (currentIdx !== -1 && currentIdx < allEpisodes.length - 1) {
+          const nextEp = allEpisodes[currentIdx + 1];
+          setNextEpisodeData({
+            id: nextEp.id,
+            code: nextEp.code,
+            title: nextEp.title,
+            streamUrl: nextEp.streamUrl,
+            poster: nextEp.poster || show.poster,
+            audioStreams: nextEp.audioStreams,
+            subtitleStreams: nextEp.subtitleStreams,
+          });
+          setCurrentEpisodeIndex(currentIdx);
+        } else {
+          setNextEpisodeData(null);
+          setCurrentEpisodeIndex(-1);
+        }
+      } else {
+        setNextEpisodeData(null);
+        setCurrentEpisodeIndex(-1);
+      }
+    } else {
+      setNextEpisodeData(null);
+      setCurrentEpisodeIndex(-1);
+    }
+
+    setPlayerVisible(true);
+  };
+
+  const handlePlayNextEpisode = useCallback(() => {
+    if (!nextEpisodeData) return;
+    const { id, code, title, streamUrl, poster, audioStreams, subtitleStreams } = nextEpisodeData;
+    setPlayerVisible(false);
+    setTimeout(() => {
+      let showId = playerShowId;
+      let showName = playerShowName;
+      const show = [...plexShows, ...animeShows, ...doramasShows].find(s => s.id === showId);
+      if (show) {
+        const ep = show.seasons.flatMap(s => s.episodes).find(e => e.id === id);
+        if (ep) {
+          openPlayer(
+            ep,
+            'episode',
+            `${show.title} - ${ep.code}`,
+            ep.streamUrl,
+            ep.poster || show.poster,
+            show.id,
+            show.title,
+            ep.code,
+            0,
+            ep.audioStreams,
+            ep.subtitleStreams
+          );
+          return;
+        }
+      }
+      openPlayer(
+        { id },
+        'episode',
+        `${showName || 'Serie'} - ${code}`,
+        streamUrl,
+        poster,
+        showId,
+        showName,
+        code,
+        0,
+        audioStreams,
+        subtitleStreams
+      );
+    }, 150);
+  }, [nextEpisodeData, playerShowId, playerShowName, plexShows, animeShows, doramasShows]);
+
+  const handlePlayWithResume = (item: ContinueWatchingItem) => {
+    if (!item.progress || item.progress < 3) {
+      openPlayer(item, item.type, item.title, item.streamUrl, item.poster, item.showId, item.showName, item.episodeCode, 0, item.audioStreams, item.subtitleStreams);
+      return;
+    }
+    setResumeItem(item);
+    setResumeDialogVisible(true);
+  };
+
+  const handleResume = () => {
+    if (resumeItem) {
+      openPlayer(resumeItem, resumeItem.type, resumeItem.title, resumeItem.streamUrl, resumeItem.poster, resumeItem.showId, resumeItem.showName, resumeItem.episodeCode, resumeItem.progress, resumeItem.audioStreams, resumeItem.subtitleStreams);
+    }
+    setResumeDialogVisible(false);
+    setResumeItem(null);
+  };
+
+  const handleRestart = () => {
+    if (resumeItem) {
+      openPlayer(resumeItem, resumeItem.type, resumeItem.title, resumeItem.streamUrl, resumeItem.poster, resumeItem.showId, resumeItem.showName, resumeItem.episodeCode, 0, resumeItem.audioStreams, resumeItem.subtitleStreams);
+    }
+    setResumeDialogVisible(false);
+    setResumeItem(null);
+  };
+
+  const handleCancelResume = () => {
+    setResumeDialogVisible(false);
+    setResumeItem(null);
+  };
+
+  const toggleLiveFullscreen = () => {
+    setIsLiveFullscreen(!isLiveFullscreen);
+    if (!isLiveFullscreen) setShowChannelOverlay(false);
+  };
+
+  const navigateToMenu = (menuId: string) => {
+    setSelectedMenu(menuId);
+    setViewMode('grid');
+    setSelectedShow(null);
+    if (menuId === 'DORAMAS') cargarDoramasPlex();
+    if (menuId === 'ANIME') cargarAnimePlex();
+    if (menuId === 'SERIES') cargarSeries();
+    if (menuId === 'PELÍCULAS') cargarPeliculas();
+    if (menuId === 'CONTINUAR' || menuId === 'HISTORIAL') loadContinueWatching();
+  };
+
+  // ---- MANEJO DE TECLA BACK (TV) ----
+  useEffect(() => {
+    let tvEventHandler: any;
+    if (Platform.isTV) {
+      tvEventHandler = new TVEventHandler();
+      tvEventHandler.enable(this, (cmp: any, evt: any) => {
+        if (evt && evt.eventType === 'back') {
+          if (resumeDialogVisible) { handleCancelResume(); }
+          else if (playerVisible) { setPlayerVisible(false); }
+          else if (showChannelOverlay) { setShowChannelOverlay(false); }
+          else if (isLiveFullscreen) { toggleLiveFullscreen(); }
+          else if (viewMode === 'detail') { setViewMode('grid'); setSelectedShow(null); }
+          else if (searchVisible) { setSearchVisible(false); }
+          else if (activationModalVisible) { setActivationModalVisible(false); }
+        }
+      });
+    }
+    return () => {
+      if (tvEventHandler) tvEventHandler.disable();
+    };
+  }, [resumeDialogVisible, playerVisible, showChannelOverlay, isLiveFullscreen, viewMode, searchVisible, activationModalVisible]);
+
+  // ---- INICIALIZACIÓN ----
+  useEffect(() => {
+    const init = async () => {
+      // Obtener el ID del dispositivo
+      const id = await getDeviceId();
+      setDeviceId(id);
+
+      const status = await checkAccessStatus();
+      setAccessValid(status.valid);
+      setAccessDaysLeft(status.daysLeft);
+      setAccessExpired(status.expired);
+      setIsActivated(status.isActivated);
+      setCheckingAccess(false);
+
+      if (status.valid) {
+        await loadProfiles();
+        await cargarCanalesDesdeServidor(false);
+        if (M3U_URL) await cargarListaM3U();
+        await cargarPeliculas();
+        await cargarSeries();
+        await cargarAnimePlex();
+        await cargarDoramasPlex();
+        await loadContinueWatching();
+        await lockLandscape();
+
+        if (!status.isActivated) {
+          const deviceId = await getDeviceId();
+          const raw = await AsyncStorage.getItem(TRIAL_KEY);
+          if (raw) {
+            const trialData: TrialData = JSON.parse(raw);
+            await reportTrialToServer(deviceId, trialData.startDate);
+          }
+        }
+      }
+
+      await syncRemoteStatus();
+    };
+    init();
+    return () => {};
+  }, [syncRemoteStatus]);
+
+  // ---- CONTENIDO DEL CENTRO ----
+  const renderCenterContent = () => {
+    if (viewMode === 'detail' && selectedShow) {
+      return (
+        <SeriesDetail
+          show={selectedShow}
+          onBack={() => { setViewMode('grid'); setSelectedShow(null); }}
+          onPlayEpisode={(ep: PlexEpisode) => {
+            openPlayer(ep, 'episode', `${selectedShow.title} - ${ep.code}`, ep.streamUrl, ep.poster || selectedShow.poster, selectedShow.id, selectedShow.title, ep.code, 0, ep.audioStreams, ep.subtitleStreams);
+          }}
+          continueWatchingItems={continueWatchingItems}
+          onPlayNextEpisode={(ep: PlexEpisode) => {
+            openPlayer(ep, 'episode', `${selectedShow.title} - ${ep.code}`, ep.streamUrl, ep.poster || selectedShow.poster, selectedShow.id, selectedShow.title, ep.code, 0, ep.audioStreams, ep.subtitleStreams);
+          }}
+        />
+      );
+    }
+
+    if (selectedMenu === 'TV') {
+      return (
+        <LivePlayerMini
+          url={currentUrl}
+          channel={currentChannel}
+          loading={loadingChannels}
+          onToggleFullscreen={toggleLiveFullscreen}
+          onToggleChannelOverlay={() => setShowChannelOverlay(!showChannelOverlay)}
+          fullscreen={false}
+          sourceOptions={sourceOptions}
+          selectedSourceIndex={selectedSourceIndex}
+          onSelectSource={selectSource}
+          onSourceError={() => {
+            if (sourceOptions.length > 1 && selectedSourceIndex < sourceOptions.length - 1) {
+              selectSource(selectedSourceIndex + 1);
+            } else {
+              Alert.alert('Error', 'El stream ha fallado y no hay más fuentes disponibles.');
+            }
+          }}
+        />
+      );
+    } else if (selectedMenu === 'PELÍCULAS') {
+      return (
+        <MoviesGrid
+          items={driveMovies}
+          loading={loadingDrive}
+          onRefresh={() => cargarPeliculas(true)}
+          onPlay={(item: MediaItem) => {
+            openPlayer(item, 'movie', item.title, item.streamUrl || '', item.poster, undefined, undefined, undefined, 0, item.audioStreams, item.subtitleStreams);
+          }}
+        />
+      );
+    } else if (selectedMenu === 'SERIES') {
+      return (
+        <SeriesGrid
+          shows={plexShows}
+          loading={loadingPlex}
+          onRefresh={() => cargarSeries(true)}
+          onSelectShow={(show: PlexShow) => {
+            setSelectedShow(show);
+            setViewMode('detail');
+          }}
+        />
+      );
+    } else if (selectedMenu === 'ANIME') {
+      return (
+        <SeriesGrid
+          shows={animeShows}
+          loading={loadingAnime}
+          onRefresh={() => cargarAnimePlex(true)}
+          onSelectShow={(show: PlexShow) => {
+            setSelectedShow(show);
+            setViewMode('detail');
+          }}
+          title="Anime"
+        />
+      );
+    } else if (selectedMenu === 'DORAMAS') {
+      return (
+        <SeriesGrid
+          shows={doramasShows}
+          loading={loadingDoramas}
+          onRefresh={() => cargarDoramasPlex(true)}
+          onSelectShow={(show: PlexShow) => {
+            setSelectedShow(show);
+            setViewMode('detail');
+          }}
+          title="Doramas"
+        />
+      );
+    } else if (selectedMenu === 'CONTINUAR') {
+      return <ContinueWatchingView items={continueWatchingItems} onPlay={handlePlayWithResume} />;
+    } else if (selectedMenu === 'HISTORIAL') {
+      return <HistoryView items={continueWatchingItems} onPlay={handlePlayWithResume} />;
+    } else if (selectedMenu === 'AJUSTES') {
+      return (
+        <SettingsView
+          onActivatePress={() => {
+            setActivationModalMode('voluntary');
+            setActivationModalVisible(true);
+          }}
+          onRenewPress={() => {
+            setActivationModalMode('renew');
+            setActivationModalVisible(true);
+          }}
+          isActivated={isActivated}
+          daysLeft={accessDaysLeft}
+          onSyncPress={syncRemoteStatus}
+          onRefreshChannelsPress={() => cargarCanalesDesdeServidor(true)}
+          deviceId={deviceId}
+        />
+      );
+    } else {
+      return (
+        <View style={stylesTV.centerPlaceholder}>
+          <Text style={stylesTV.placeholderText}>Sección en desarrollo</Text>
+        </View>
+      );
+    }
+  };
+
+  // ---- RENDER PRINCIPAL ----
+  const currentProfile = profiles.find(p => p.id === currentProfileId);
+
+  if (checkingAccess) {
+    return (
+      <View style={stylesTV.container}>
+        <StatusBar hidden />
+        <View style={stylesTV.centerLoading}>
+          <ActivityIndicator size="large" color="#ff1744" />
+          <Text style={stylesTV.loadingText}>Verificando acceso...</Text>
+        </View>
+      </View>
+    );
+  }
+
+  if (!accessValid) {
+    return (
+      <View style={stylesTV.container}>
+        <StatusBar hidden />
+        <ActivationModal
+          visible={true}
+          onClose={() => {}}
+          onActivateSuccess={async () => {
+            const status = await checkAccessStatus();
+            setAccessValid(status.valid);
+            setAccessExpired(status.expired);
+            setAccessDaysLeft(status.daysLeft);
+            setIsActivated(status.isActivated);
+            if (status.valid) {
+              await loadProfiles();
+              await cargarCanalesDesdeServidor(false);
+              if (M3U_URL) await cargarListaM3U();
+              await cargarPeliculas();
+              await cargarSeries();
+              await cargarAnimePlex();
+              await cargarDoramasPlex();
+              await loadContinueWatching();
+              await syncRemoteStatus();
+            }
+          }}
+          mode="expired"
+          deviceId={deviceId}
+        />
+      </View>
+    );
+  }
+
+  if (showProfileScreen) {
+    return (
+      <View style={stylesTV.container}>
+        <StatusBar hidden />
+        <ProfileScreen
+          profiles={profiles}
+          onSelectProfile={handleSelectProfile}
+          onCreateProfile={handleCreateProfile}
+          onDeleteProfile={handleDeleteProfile}
+        />
+      </View>
+    );
+  }
+
+  return (
+    <View style={stylesTV.container}>
+      <StatusBar hidden />
+
+      <GlobalSearch
+        visible={searchVisible}
+        onClose={() => setSearchVisible(false)}
+        movies={driveMovies}
+        series={plexShows}
+        anime={animeShows}
+        doramas={doramasShows}
+        channels={listaCanales}
+        onPlayMedia={openPlayer}
+        onSelectShow={(show: PlexShow) => {
+          const found = [...plexShows, ...animeShows, ...doramasShows].find(s => s.id === show.id);
+          if (found) {
+            setSelectedShow(found);
+            setViewMode('detail');
+            setSelectedMenu('SERIES');
+          }
+        }}
+        onSelectChannel={playChannel}
+      />
+
+      <ResumeDialog
+        visible={resumeDialogVisible}
+        item={resumeItem}
+        onResume={handleResume}
+        onRestart={handleRestart}
+        onCancel={handleCancelResume}
+      />
+
+      {playerVisible && playerUrl && (
+        <ReproductorMejorado
+          url={playerUrl}
+          onClose={() => setPlayerVisible(false)}
+          title={playerTitle}
+          id={playerId}
+          poster={playerPoster}
+          type={playerType}
+          showId={playerShowId}
+          showName={playerShowName}
+          episodeCode={playerEpisodeCode}
+          sourceOptions={sourceOptions}
+          selectedSourceIndex={selectedSourceIndex}
+          onSelectSource={selectSource}
+          initialTime={playerInitialTime}
+          nextEpisode={nextEpisodeData}
+          onPlayNextEpisode={handlePlayNextEpisode}
+          autoPlayNext={true}
+          audioStreams={playerAudioStreams}
+          subtitleStreams={playerSubtitleStreams}
+        />
+      )}
+
+      {selectedMenu === 'TV' && isLiveFullscreen ? (
+        <View style={{ flex: 1, flexDirection: 'row', backgroundColor: '#000' }}>
+          <View style={{ flex: 1 }}>
+            <LivePlayerMini
+              url={currentUrl}
+              channel={currentChannel}
+              loading={loadingChannels}
+              onToggleFullscreen={toggleLiveFullscreen}
+              onToggleChannelOverlay={() => setShowChannelOverlay(!showChannelOverlay)}
+              fullscreen={true}
+              sourceOptions={sourceOptions}
+              selectedSourceIndex={selectedSourceIndex}
+              onSelectSource={selectSource}
+              onSourceError={() => {
+                if (sourceOptions.length > 1 && selectedSourceIndex < sourceOptions.length - 1) {
+                  selectSource(selectedSourceIndex + 1);
+                } else {
+                  Alert.alert('Error', 'El stream ha fallado y no hay más fuentes disponibles.');
+                }
+              }}
+            />
+          </View>
+          {showChannelOverlay && (
+            <View style={stylesTV.channelListOverlayContainer}>
+              <ChannelList
+                channels={listaCanales}
+                currentChannel={currentChannel}
+                favorites={favorites}
+                onSelectChannel={playChannel}
+                onToggleFavorite={async (id: string) => {
+                  const newFavs = favorites.includes(id) ? favorites.filter(f => f !== id) : [...favorites, id];
+                  setFavorites(newFavs);
+                  await saveFavorites(newFavs);
+                }}
+                onClose={() => setShowChannelOverlay(false)}
+                isOverlay={true}
+              />
+            </View>
+          )}
+        </View>
+      ) : (
+        <View style={stylesTV.layout}>
+          <View style={stylesTV.leftPanel}>
+            <View style={stylesTV.logoContainer}>
+              <Text style={stylesTV.logoText}>|NEXUS|<Text style={stylesTV.logoAccent}></Text></Text>
+            </View>
+            <FlatList
+              data={[
+                { id: 'TV', label: 'TV', icon: 'tv' },
+                { id: 'PELÍCULAS', label: 'PELÍCULAS', icon: 'film' },
+                { id: 'SERIES', label: 'SERIES', icon: 'tv-outline' },
+                { id: 'ANIME', label: 'ANIME', icon: 'brush' },
+                { id: 'DORAMAS', label: 'DORAMAS', icon: 'heart' },
+              ]}
+              keyExtractor={item => item.id}
+              renderItem={({ item }) => {
+                const isActive = selectedMenu === item.id;
+                return (
+                  <Focusable
+                    style={[stylesTV.menuItem, isActive && stylesTV.menuItemActive]}
+                    onPress={() => navigateToMenu(item.id)}
+                    hasTVPreferredFocus={item.id === 'TV'}
+                  >
+                    <Ionicons
+                      name={item.icon as any}
+                      size={rs(28)}
+                      color={isActive ? '#ff1744' : 'rgba(255,255,255,0.6)'}
+                      style={stylesTV.menuIcon}
+                    />
+                    <Text style={[stylesTV.menuText, isActive && stylesTV.menuTextActive]}>
+                      {item.label}
+                    </Text>
+                    {isActive && <View style={stylesTV.menuIndicator} />}
+                  </Focusable>
+                );
+              }}
+              contentContainerStyle={{ paddingBottom: rs(60) }}
+            />
+          </View>
+
+          <View style={[stylesTV.centerPanel, { overflow: 'hidden' }]}>
+            <AppHeader
+              userName={currentProfile?.name || 'Invitado'}
+              avatarUrl={undefined}
+              daysLeft={accessDaysLeft}
+              isActivated={isActivated}
+              onActivatePress={() => {
+                setActivationModalMode('voluntary');
+                setActivationModalVisible(true);
+              }}
+              onRenewPress={() => {
+                setActivationModalMode('renew');
+                setActivationModalVisible(true);
+              }}
+              onSyncPress={syncRemoteStatus}
+              onRefreshChannelsPress={() => cargarCanalesDesdeServidor(true)}
+              onSettingsPress={() => navigateToMenu('AJUSTES')}
+              onHistoryPress={() => { navigateToMenu('HISTORIAL'); loadContinueWatching(); }}
+              onContinueWatchingPress={() => { navigateToMenu('CONTINUAR'); loadContinueWatching(); }}
+              onSearchPress={() => setSearchVisible(true)}
+              onProfilePress={() => setShowProfileScreen(true)}
+            />
+            <View style={{ flex: 1, overflow: 'hidden' }}>
+              {renderCenterContent()}
+            </View>
+          </View>
+
+          {selectedMenu === 'TV' && viewMode !== 'detail' && (
+            <View style={stylesTV.rightPanel}>
+              <ChannelList
+                channels={listaCanales}
+                currentChannel={currentChannel}
+                favorites={favorites}
+                onSelectChannel={playChannel}
+                onToggleFavorite={async (id: string) => {
+                  const newFavs = favorites.includes(id) ? favorites.filter(f => f !== id) : [...favorites, id];
+                  setFavorites(newFavs);
+                  await saveFavorites(newFavs);
+                }}
+                isOverlay={false}
+              />
+            </View>
+          )}
+        </View>
+      )}
+
+      <ActivationModal
+        visible={activationModalVisible}
+        onClose={() => setActivationModalVisible(false)}
+        onActivateSuccess={async () => {
+          const status = await checkAccessStatus();
+          setAccessValid(status.valid);
+          setAccessExpired(status.expired);
+          setAccessDaysLeft(status.daysLeft);
+          setIsActivated(status.isActivated);
+          if (status.valid) {
+            await loadProfiles();
+            await cargarCanalesDesdeServidor(false);
+            if (M3U_URL) await cargarListaM3U();
+            await cargarPeliculas();
+            await cargarSeries();
+            await cargarAnimePlex();
+            await cargarDoramasPlex();
+            await loadContinueWatching();
+          }
+          setActivationModalVisible(false);
+        }}
+        mode={activationModalMode}
+        deviceId={deviceId}
+      />
+    </View>
+  );
+}
+
+// ============================================================
+// ESTILOS (completos, con escalado responsivo)
+// ============================================================
+const stylesTV = StyleSheet.create({
+  container: { flex: 1, backgroundColor: '#0a0a1a' },
+  layout: { flex: 1, flexDirection: 'row' },
+  leftPanel: {
+    width: rs(240),
+    backgroundColor: 'rgba(20, 15, 35, 0.85)',
+    paddingVertical: rs(40),
+    paddingHorizontal: rs(20),
+    borderRightWidth: 1,
+    borderRightColor: 'rgba(255,255,255,0.08)',
+  },
+  logoContainer: {
+    marginBottom: rs(60),
+    paddingLeft: rs(10),
+  },
+  logoText: {
+    color: '#fff',
+    fontSize: rs(44),
+    fontWeight: '900',
+    letterSpacing: rs(4),
+    textShadowColor: 'rgba(255,23,68,0.6)',
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 20,
+  },
+  logoAccent: { color: '#ff1744', textShadowColor: 'rgba(255,23,68,0.9)', textShadowRadius: 25 },
+  menuItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: rs(18),
+    paddingHorizontal: rs(20),
+    marginBottom: rs(8),
+    borderRadius: rs(14),
+    backgroundColor: 'transparent',
+    borderWidth: 1,
+    borderColor: 'transparent',
+  },
+  menuItemActive: {
+    backgroundColor: 'rgba(255,23,68,0.12)',
+    borderRightWidth: rs(4),
+    borderRightColor: '#ff1744',
+    borderColor: 'rgba(255,23,68,0.3)',
+  },
+  menuIcon: {
+    marginRight: rs(18),
+    textShadowColor: 'rgba(255,23,68,0.3)',
+    textShadowRadius: 10,
+  },
+  menuText: {
+    color: 'rgba(255,255,255,0.7)',
+    fontSize: rs(20),
+    fontWeight: '600',
+    letterSpacing: rs(0.8),
+  },
+  menuTextActive: {
+    color: '#FFFFFF',
+    fontWeight: '700',
+    textShadowColor: 'rgba(255,23,68,0.4)',
+    textShadowOffset: { width: 0, height: 0 },
+    textShadowRadius: 12,
+  },
+  menuIndicator: {
+    position: 'absolute',
+    right: 0,
+    top: '15%',
+    height: '70%',
+    width: 4,
+    backgroundColor: '#ff1744',
+    borderRadius: 4,
+  },
+  centerPanel: { flex: 1, backgroundColor: '#0a0a1a' },
+  centerPlaceholder: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'transparent' },
+  placeholderText: { color: 'rgba(255,255,255,0.2)', fontSize: rs(32), fontWeight: '600', letterSpacing: 2 },
+  centerLoading: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'transparent' },
+  rightPanel: {
+    width: rs(280),
+    backgroundColor: 'rgba(20, 15, 35, 0.85)',
+    paddingVertical: rs(20),
+    paddingHorizontal: rs(12),
+    borderLeftWidth: 1,
+    borderLeftColor: 'rgba(255,255,255,0.08)',
+  },
+  channelListContainer: { flex: 1 },
+  channelListOverlay: {
+    position: 'absolute',
+    right: 0,
+    top: 0,
+    bottom: 0,
+    width: rs(280),
+    backgroundColor: 'rgba(20, 15, 35, 0.96)',
+    paddingVertical: rs(20),
+    paddingHorizontal: rs(12),
+    borderLeftWidth: 1,
+    borderLeftColor: 'rgba(255,255,255,0.1)',
+    zIndex: 10,
+  },
+  channelListOverlayContainer: {
+    position: 'absolute',
+    right: 0,
+    top: 0,
+    bottom: 0,
+    width: rs(280),
+    zIndex: 20,
+  },
+  channelListHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 8,
+    paddingBottom: rs(14),
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.06)',
+    marginBottom: rs(10),
+  },
+  rightTitle: {
+    color: 'rgba(255,255,255,0.9)',
+    fontSize: rs(18),
+    fontWeight: '800',
+    letterSpacing: 1.5,
+  },
+  closeOverlayBtn: {
+    padding: rs(8),
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    borderRadius: 24,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+  },
+  channelItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: rs(12),
+    paddingHorizontal: rs(12),
+    borderRadius: 10,
+    marginBottom: rs(4),
+    backgroundColor: 'transparent',
+    borderWidth: 1,
+    borderColor: 'transparent',
+  },
+  channelItemActive: {
+    backgroundColor: 'rgba(255,23,68,0.12)',
+    borderLeftWidth: 4,
+    borderLeftColor: '#ff1744',
+  },
+  channelLogoContainer: {
+    width: rs(44),
+    height: rs(44),
+    borderRadius: 10,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: rs(12),
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+  },
+  channelLogo: { width: '100%', height: '100%', resizeMode: 'contain' },
+  channelLogoFallback: { color: 'rgba(255,255,255,0.4)', fontSize: rs(22), fontWeight: '800' },
+  channelInfo: { flex: 1, justifyContent: 'center' },
+  channelName: {
+    color: '#FFFFFF',
+    fontSize: rs(16),
+    fontWeight: '600',
+    letterSpacing: 0.3,
+  },
+  channelNow: {
+    color: 'rgba(255,255,255,0.45)',
+    fontSize: rs(12),
+    marginTop: 1,
+  },
+  channelActiveIndicator: { marginLeft: 4 },
+  headerContainer: {
+    height: rs(80),
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: rs(30),
+    backgroundColor: 'rgba(10, 10, 26, 0.7)',
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.05)',
+  },
+  headerLeft: { flexDirection: 'row', alignItems: 'center' },
+  avatarContainer: { marginRight: rs(16) },
+  avatar: {
+    width: rs(48),
+    height: rs(48),
+    borderRadius: rs(24),
+    borderWidth: 2,
+    borderColor: 'rgba(255,23,68,0.4)',
+  },
+  avatarPlaceholder: {
+    width: rs(48),
+    height: rs(48),
+    borderRadius: rs(24),
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 2,
+    borderColor: 'rgba(255,23,68,0.6)',
+  },
+  userName: { color: '#fff', fontSize: rs(22), fontWeight: '700', letterSpacing: 0.5 },
+  // Nuevos badges
+  badgePremium: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,215,0,0.15)',
+    borderColor: '#FFD700',
+    borderWidth: 1,
+    borderRadius: 20,
+    paddingHorizontal: rs(12),
+    paddingVertical: rs(4),
+    marginLeft: rs(12),
+  },
+  badgeTrial: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,165,0,0.15)',
+    borderColor: '#FFA500',
+    borderWidth: 1,
+    borderRadius: 20,
+    paddingHorizontal: rs(12),
+    paddingVertical: rs(4),
+    marginLeft: rs(12),
+  },
+  badgeExpired: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,23,68,0.15)',
+    borderColor: '#ff1744',
+    borderWidth: 1,
+    borderRadius: 20,
+    paddingHorizontal: rs(12),
+    paddingVertical: rs(4),
+    marginLeft: rs(12),
+  },
+  badgeText: {
+    color: '#fff',
+    fontSize: rs(18),
+    fontWeight: '600',
+    marginLeft: rs(6),
+  },
+  trialDays: {
+    color: '#F5C842',
+    fontSize: rs(16),
+    fontWeight: '600',
+    marginLeft: rs(16),
+    backgroundColor: 'rgba(0,0,0,0.4)',
+    paddingHorizontal: rs(12),
+    paddingVertical: rs(4),
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(245,200,66,0.3)',
+  },
+  headerRight: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' },
+  headerBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginLeft: rs(30),
+    paddingVertical: rs(10),
+    paddingHorizontal: rs(18),
+    borderRadius: 25,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: 'rgba(255,255,255,0.03)',
+  },
+  headerBtnPrimary: { backgroundColor: 'rgba(255,23,68,0.15)', borderColor: 'rgba(255,23,68,0.3)' },
+  headerBtnSecondary: { backgroundColor: 'rgba(255,255,255,0.04)' },
+  headerBtnText: { color: '#fff', fontSize: rs(18), fontWeight: '600', marginLeft: rs(6), letterSpacing: 0.5 },
+  liveContainer: { flex: 1, backgroundColor: '#0a0a1a' },
+  miniControls: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'space-between',
+    padding: rs(25),
+  },
+  miniTopBar: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: rs(20),
+  },
+  miniTitle: {
+    color: '#fff',
+    fontSize: rs(36),
+    fontWeight: '800',
+    textShadowColor: 'rgba(0,0,0,0.9)',
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 8,
+  },
+  miniActions: { flexDirection: 'row', gap: rs(16) },
+  miniBtn: {
+    padding: rs(18),
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    borderRadius: 30,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+  },
+  miniCenter: { alignItems: 'center', justifyContent: 'center' },
+  miniPlayBtn: { padding: 8 },
+  miniPlayGradient: {
+    width: rs(120),
+    height: rs(120),
+    borderRadius: rs(60),
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  messagesSection: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+    backgroundColor: 'transparent',
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.05)',
+  },
+  messagesContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,255,255,0.03)',
+    paddingVertical: rs(10),
+    paddingHorizontal: rs(32),
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.05)',
+    width: '90%',
+    maxWidth: 800,
+  },
+  messageIcon: { marginRight: rs(16) },
+  messageText: {
+    color: 'rgba(255,255,255,0.85)',
+    fontSize: rs(18),
+    fontWeight: '500',
+    textAlign: 'center',
+    flex: 1,
+    letterSpacing: 0.3,
+  },
+  gridContainer: {
+    flex: 1,
+    backgroundColor: 'transparent',
+    paddingHorizontal: rs(30),
+    paddingTop: rs(30),
+  },
+  gridSectionTitle: {
+    color: 'rgba(255,255,255,0.95)',
+    fontSize: rs(30),
+    fontWeight: '800',
+    marginBottom: rs(20),
+    letterSpacing: rs(1.5),
+  },
+  gridSearch: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    borderRadius: 16,
+    paddingHorizontal: rs(20),
+    marginBottom: rs(25),
+    height: rs(60),
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.06)',
+  },
+  gridSearchInput: { flex: 1, color: '#fff', fontSize: rs(20), marginLeft: rs(16), fontWeight: '400' },
+  gridItem: {
+    width: getGridItemWidth(),
+    marginRight: '2%',
+    marginBottom: rs(32),
+    alignItems: 'center',
+  },
+  gridPosterContainer: {
+    width: '100%',
+    aspectRatio: 2 / 3,
+    borderRadius: 16,
+    backgroundColor: '#1a1a2e',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.7,
+    shadowRadius: 12,
+    elevation: 10,
+    position: 'relative',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.04)',
+    overflow: 'hidden',
+  },
+  gridPoster: { width: '100%', height: '100%', borderRadius: 16 },
+  gridRating: {
+    position: 'absolute',
+    bottom: 8,
+    right: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    paddingHorizontal: rs(12),
+    paddingVertical: rs(6),
+    borderRadius: 12,
+  },
+  gridRatingText: { color: '#fff', fontSize: rs(16), marginLeft: 4, fontWeight: '700' },
+  gridTitle: {
+    color: '#fff',
+    fontSize: rs(18),
+    fontWeight: '600',
+    marginTop: rs(10),
+    textAlign: 'center',
+    textShadowColor: 'rgba(0,0,0,0.8)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 4,
+    letterSpacing: 0.3,
+  },
+  gridSubtitle: {
+    color: 'rgba(255,255,255,0.5)',
+    fontSize: rs(14),
+    textAlign: 'center',
+    marginTop: 2,
+    fontWeight: '400',
+  },
+  gridYear: { color: 'rgba(255,255,255,0.4)', fontSize: rs(16), textAlign: 'center', marginTop: 2, fontWeight: '500' },
+  detailBackBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: rs(20),
+    paddingVertical: rs(12),
+    paddingHorizontal: rs(18),
+    borderRadius: 10,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.06)',
+    alignSelf: 'flex-start',
+  },
+  detailBackText: { color: '#fff', fontSize: rs(22), fontWeight: '700', marginLeft: 6 },
+  detailOverview: {
+    color: 'rgba(255,255,255,0.7)',
+    fontSize: rs(18),
+    marginBottom: rs(28),
+    lineHeight: rs(26),
+    paddingHorizontal: 4,
+    letterSpacing: 0.3,
+  },
+  detailSeasonBlock: { marginBottom: rs(36) },
+  detailEpisodeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: rs(18),
+    paddingHorizontal: rs(16),
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.03)',
+    backgroundColor: 'rgba(255,255,255,0.02)',
+    borderRadius: 12,
+    marginBottom: rs(8),
+    borderWidth: 1,
+    borderColor: 'transparent',
+  },
+  detailEpisodeCodeBox: {
+    backgroundColor: 'rgba(255,23,68,0.15)',
+    paddingHorizontal: rs(14),
+    paddingVertical: rs(8),
+    borderRadius: 8,
+    marginRight: rs(18),
+    borderWidth: 1,
+    borderColor: 'rgba(255,23,68,0.2)',
+  },
+  detailEpisodeCode: { color: '#ff1744', fontSize: rs(16), fontWeight: '700', letterSpacing: 0.5 },
+  detailEpisodeTitle: { color: '#fff', fontSize: rs(18), flex: 1, fontWeight: '500' },
+  modalFullscreen: { flex: 1, backgroundColor: '#000' },
+  modalLoading: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.8)',
+    zIndex: 10,
+  },
+  modalControls: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'space-between',
+    paddingHorizontal: rs(30),
+    paddingVertical: rs(60),
+  },
+  modalControlTop: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+  },
+  playerTitle: {
+    color: '#fff',
+    fontSize: rs(28),
+    fontWeight: '800',
+    textShadowColor: 'rgba(0,0,0,0.9)',
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 8,
+    flex: 1,
+    letterSpacing: 0.5,
+  },
+  sourceBtn: {
+    padding: rs(12),
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    borderRadius: 30,
+    marginLeft: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+  },
+  modalControlCenter: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: rs(40),
+  },
+  controlBtn: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 10,
+    borderRadius: 40,
+    backgroundColor: 'rgba(0,0,0,0.3)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.05)',
+  },
+  modalPlayBtn: {
+    width: rs(110),
+    height: rs(110),
+    borderRadius: rs(55),
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#ff1744',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.7,
+    shadowRadius: 30,
+    elevation: 20,
+  },
+  modalPlayGradient: {
+    width: '100%',
+    height: '100%',
+    borderRadius: rs(55),
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modalControlBottom: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: rs(20),
+  },
+  modalError: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.9)',
+  },
+  controlLabel: { color: 'rgba(255,255,255,0.6)', fontSize: rs(16), marginTop: 2, fontWeight: '600' },
+  timeText: {
+    color: '#fff',
+    fontSize: rs(20),
+    fontWeight: '600',
+    minWidth: rs(70),
+    textAlign: 'center',
+    textShadowColor: 'rgba(0,0,0,0.8)',
+    textShadowRadius: 4,
+  },
+  errorText: { color: '#fff', fontSize: rs(24), marginTop: 16, textAlign: 'center', fontWeight: '700', letterSpacing: 0.5 },
+  progressTrack: { flex: 1, height: rs(14), justifyContent: 'center', position: 'relative' },
+  progressBg: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    height: rs(6),
+    borderRadius: 3,
+    backgroundColor: 'rgba(255,255,255,0.15)',
+  },
+  progressFill: {
+    position: 'absolute',
+    left: 0,
+    height: rs(8),
+    borderRadius: 4,
+    backgroundColor: '#ff1744',
+    shadowColor: '#ff1744',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.7,
+    shadowRadius: 8,
+  },
+  progressThumb: {
+    position: 'absolute',
+    width: rs(30),
+    height: rs(30),
+    borderRadius: rs(15),
+    top: rs(-12),
+    backgroundColor: '#fff',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.5,
+    shadowRadius: 10,
+    marginLeft: rs(-15),
+    borderWidth: 2,
+    borderColor: '#ff1744',
+  },
+  sourceModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    backdropFilter: 'blur(10px)',
+  },
+  sourceModalContent: {
+    width: '85%',
+    maxHeight: '70%',
+    backgroundColor: 'rgba(20, 15, 35, 0.95)',
+    borderRadius: 24,
+    padding: rs(30),
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.8,
+    shadowRadius: 30,
+    elevation: 30,
+  },
+  sourceModalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: rs(25),
+  },
+  sourceModalTitle: { color: '#fff', fontSize: rs(28), fontWeight: '800', letterSpacing: 0.5 },
+  sourceOption: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: rs(18),
+    paddingHorizontal: rs(16),
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.04)',
+  },
+  sourceOptionSelected: {
+    backgroundColor: 'rgba(255,23,68,0.1)',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(255,23,68,0.3)',
+  },
+  sourceOptionText: { color: 'rgba(255,255,255,0.8)', fontSize: rs(20), fontWeight: '500' },
+  sourceOptionTextSelected: { color: '#fff', fontWeight: '700' },
+  tracksTabBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingVertical: rs(12),
+    borderRadius: 12,
+    marginHorizontal: rs(4),
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.06)',
+  },
+  tracksTabBtnActive: {
+    backgroundColor: 'rgba(255,23,68,0.18)',
+    borderColor: 'rgba(255,23,68,0.4)',
+  },
+  tracksTabText: { color: 'rgba(255,255,255,0.6)', fontSize: rs(18), fontWeight: '600', marginLeft: 8 },
+  tracksTabTextActive: { color: '#fff' },
+  resumeOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    backdropFilter: 'blur(10px)',
+  },
+  resumeContent: {
+    width: '85%',
+    backgroundColor: 'rgba(20, 15, 35, 0.95)',
+    borderRadius: 24,
+    padding: rs(30),
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.8,
+    shadowRadius: 30,
+    elevation: 30,
+  },
+  resumeHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    width: '100%',
+    marginBottom: rs(20),
+  },
+  resumeTitle: { color: '#fff', fontSize: rs(28), fontWeight: '800', letterSpacing: 0.5 },
+  resumePoster: {
+    width: rs(160),
+    height: rs(240),
+    borderRadius: 16,
+    marginBottom: rs(20),
+    backgroundColor: '#2a2a3e',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.05)',
+  },
+  resumeItemTitle: { color: '#fff', fontSize: rs(22), fontWeight: '700', textAlign: 'center', marginBottom: rs(12), letterSpacing: 0.3 },
+  resumeProgressText: { color: 'rgba(255,255,255,0.6)', fontSize: rs(20), marginBottom: rs(25), fontWeight: '500' },
+  resumeButtons: { width: '100%' },
+  resumeBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: rs(18),
+    borderRadius: 14,
+    marginBottom: rs(16),
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.06)',
+  },
+  resumeBtnPrimary: {
+    backgroundColor: '#ff1744',
+    borderColor: 'rgba(255,23,68,0.5)',
+    shadowColor: '#ff1744',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.4,
+    shadowRadius: 15,
+    elevation: 10,
+  },
+  resumeBtnSecondary: { backgroundColor: 'rgba(255,255,255,0.04)' },
+  resumeBtnText: { color: '#fff', fontSize: rs(20), fontWeight: '700', marginLeft: 10, letterSpacing: 0.3 },
+  profileFullScreen: { flex: 1, backgroundColor: '#0a0a1a', justifyContent: 'center', alignItems: 'center' },
+  profileFullContent: { width: '80%', maxWidth: 1000, alignItems: 'center' },
+  profileFullTitle: {
+    color: '#fff',
+    fontSize: rs(52),
+    fontWeight: '900',
+    marginBottom: rs(50),
+    textShadowColor: 'rgba(255,23,68,0.3)',
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 20,
+    letterSpacing: 2,
+  },
+  profileFullList: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: rs(30) },
+  profileFullItem: {
+    alignItems: 'center',
+    padding: rs(20),
+    backgroundColor: 'rgba(255,255,255,0.03)',
+    borderRadius: 20,
+    borderWidth: 2,
+    borderColor: 'transparent',
+    minWidth: rs(150),
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 10,
+    elevation: 5,
+  },
+  profileFullAvatarContainer: { position: 'relative', marginBottom: 10 },
+  profileFullAvatar: {
+    fontSize: rs(80),
+    width: rs(130),
+    height: rs(130),
+    textAlign: 'center',
+    lineHeight: rs(130),
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    borderRadius: 65,
+    overflow: 'hidden',
+    borderWidth: 2,
+    borderColor: 'rgba(255,255,255,0.1)',
+  },
+  profileFullDelete: {
+    position: 'absolute',
+    top: -6,
+    right: -6,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    borderRadius: 14,
+    padding: 2,
+    borderWidth: 1,
+    borderColor: 'rgba(255,23,68,0.3)',
+  },
+  profileFullName: { color: '#fff', fontSize: rs(22), fontWeight: '700', marginTop: 8, letterSpacing: 0.5 },
+  profileFullAdd: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: rs(20),
+    minWidth: rs(150),
+    backgroundColor: 'rgba(255,255,255,0.02)',
+    borderRadius: 20,
+    borderWidth: 2,
+    borderColor: 'rgba(255,255,255,0.1)',
+    borderStyle: 'dashed',
+  },
+  profileFullAddCircle: {
+    width: rs(130),
+    height: rs(130),
+    borderRadius: 65,
+    backgroundColor: 'rgba(255,255,255,0.03)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.05)',
+  },
+  profileFullAddText: { color: 'rgba(255,255,255,0.5)', fontSize: rs(18), marginTop: 8, fontWeight: '600' },
+  profileFullHint: { color: 'rgba(255,255,255,0.25)', fontSize: rs(20), marginTop: rs(40), letterSpacing: 1, fontWeight: '400' },
+  profileCreateFull: {
+    width: '60%',
+    maxWidth: 500,
+    backgroundColor: 'rgba(20, 15, 35, 0.95)',
+    borderRadius: 28,
+    padding: rs(40),
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.06)',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.8,
+    shadowRadius: 30,
+    elevation: 30,
+  },
+  profileCreateTitleFull: { color: '#fff', fontSize: rs(34), fontWeight: '800', marginBottom: 30, letterSpacing: 0.5 },
+  profileInputFull: {
+    width: '100%',
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    color: '#fff',
+    fontSize: rs(20),
+    padding: rs(16),
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    marginBottom: 24,
+  },
+  profileCreateActionsFull: { flexDirection: 'row', justifyContent: 'center', gap: 16, width: '100%' },
+  searchContainer: { flex: 1, backgroundColor: '#0a0a1a', paddingTop: rs(40) },
+  searchHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: rs(30),
+    paddingBottom: rs(20),
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.05)',
+  },
+  searchInput: { flex: 1, color: '#fff', fontSize: rs(26), marginLeft: rs(16), backgroundColor: 'transparent', fontWeight: '500' },
+  searchEmpty: { flex: 1, justifyContent: 'center', alignItems: 'center' },
+  searchEmptyText: { color: 'rgba(255,255,255,0.3)', fontSize: rs(24), marginTop: 16, textAlign: 'center', fontWeight: '500' },
+  searchResultsList: { padding: rs(20) },
+  searchResultItem: {
+    flexDirection: 'row',
+    padding: rs(16),
+    marginBottom: rs(12),
+    backgroundColor: 'rgba(255,255,255,0.03)',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.04)',
+    flex: 1,
+    marginHorizontal: rs(8),
+  },
+  searchResultPoster: {
+    width: rs(80),
+    height: rs(120),
+    borderRadius: 10,
+    marginRight: rs(16),
+  },
+  searchResultInfo: { flex: 1, justifyContent: 'center' },
+  searchResultTitle: { color: '#fff', fontSize: rs(20), fontWeight: '700', letterSpacing: 0.3 },
+  searchResultSource: { color: 'rgba(255,255,255,0.4)', fontSize: rs(16), marginTop: 4 },
+  searchResultYear: { color: 'rgba(255,255,255,0.25)', fontSize: rs(14) },
+  searchResultNow: { color: '#ff1744', fontSize: rs(16), marginTop: 4 },
+  loadingText: { color: 'rgba(255,255,255,0.7)', fontSize: rs(22), marginTop: 16, fontWeight: '600', letterSpacing: 0.5 },
+  continueProgressBar: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    height: rs(8),
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    borderBottomLeftRadius: 16,
+    borderBottomRightRadius: 16,
+  },
+  continueProgressFill: {
+    height: rs(8),
+    backgroundColor: '#ff1744',
+    borderBottomLeftRadius: 16,
+    borderBottomRightRadius: 16,
+    shadowColor: '#ff1744',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.6,
+    shadowRadius: 6,
+  },
+  focused: {
+    borderColor: '#ff1744',
+    borderWidth: 2,
+    shadowColor: '#ff1744',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.9,
+    shadowRadius: 30,
+    elevation: 25,
+    transform: [{ scale: 1.05 }],
+  },
+  settingsContainer: {
+    flex: 1,
+    backgroundColor: 'transparent',
+    paddingHorizontal: rs(40),
+    paddingTop: rs(40),
+  },
+  settingsCard: {
+    backgroundColor: 'rgba(20, 15, 35, 0.8)',
+    borderRadius: 20,
+    padding: rs(32),
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.04)',
+    backdropFilter: 'blur(20px)',
+  },
+  settingsItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: rs(16),
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.04)',
+  },
+  settingsLabel: {
+    color: 'rgba(255,255,255,0.6)',
+    fontSize: rs(20),
+    fontWeight: '500',
+    marginLeft: rs(20),
+    flex: 1,
+    letterSpacing: 0.3,
+  },
+  settingsValue: { color: '#fff', fontSize: rs(20), fontWeight: '600' },
+  settingsWhatsAppBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: rs(30),
+    paddingVertical: rs(18),
+    backgroundColor: 'rgba(37,211,102,0.1)',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(37,211,102,0.3)',
+  },
+  settingsWhatsAppText: { color: '#25D366', fontSize: rs(22), fontWeight: '700', marginLeft: 12, letterSpacing: 0.5 },
+  trialExpiredContainer: { flex: 1, justifyContent: 'center', alignItems: 'center' },
+  trialExpiredContent: {
+    width: '85%',
+    maxWidth: 600,
+    backgroundColor: 'rgba(20, 15, 35, 0.95)',
+    borderRadius: 24,
+    padding: rs(40),
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.06)',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.8,
+    shadowRadius: 30,
+    elevation: 30,
+  },
+  trialExpiredTitle: { color: '#fff', fontSize: rs(34), fontWeight: '800', marginTop: 16, textAlign: 'center' },
+  trialExpiredSubtitle: {
+    color: 'rgba(255,255,255,0.7)',
+    fontSize: rs(20),
+    textAlign: 'center',
+    marginTop: 12,
+    marginBottom: 30,
+    lineHeight: 26,
+  },
+  trialExpiredActions: { width: '100%', alignItems: 'center' },
+  trialActivationForm: {
+    marginTop: 24,
+    width: '100%',
+    alignItems: 'center',
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.06)',
+    paddingTop: 24,
+  },
+  trialActivationLabel: { color: 'rgba(255,255,255,0.6)', fontSize: rs(18), marginBottom: 12 },
+  trialActivationInput: {
+    width: '100%',
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    color: '#fff',
+    fontSize: rs(20),
+    padding: rs(16),
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    marginBottom: 16,
+    textAlign: 'center',
+  },
+  trialError: { color: '#ff1744', fontSize: rs(16), marginBottom: 12, textAlign: 'center' },
+  nextEpisodeBanner: {
+    position: 'absolute',
+    bottom: rs(120),
+    left: 0,
+    right: 0,
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 20,
+    paddingHorizontal: rs(30),
+  },
+  nextEpisodeContent: {
+    backgroundColor: 'rgba(20, 20, 40, 0.9)',
+    borderRadius: 20,
+    padding: rs(24),
+    maxWidth: 600,
+    width: '100%',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.5,
+    shadowRadius: 20,
+    elevation: 15,
+  },
+  nextEpisodeTitle: {
+    color: '#ff1744',
+    fontSize: rs(22),
+    fontWeight: '800',
+    marginBottom: 8,
+    letterSpacing: 0.5,
+  },
+  nextEpisodeName: {
+    color: '#fff',
+    fontSize: rs(24),
+    fontWeight: '700',
+    textAlign: 'center',
+    marginBottom: 12,
+  },
+  nextEpisodeCountdown: {
+    color: 'rgba(255,255,255,0.6)',
+    fontSize: rs(18),
+    fontWeight: '500',
+    marginBottom: 16,
+  },
+  nextEpisodeActions: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: rs(16),
+    width: '100%',
+  },
+  seasonTabsContainer: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginBottom: rs(24),
+    marginTop: rs(8),
+    paddingHorizontal: rs(4),
+    gap: rs(8),
+  },
+  seasonTab: {
+    paddingVertical: rs(10),
+    paddingHorizontal: rs(20),
+    borderRadius: 30,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.06)',
+    marginRight: rs(8),
+    position: 'relative',
+    minWidth: rs(80),
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  seasonTabActive: {
+    backgroundColor: 'rgba(255,23,68,0.12)',
+    borderColor: '#ff1744',
+  },
+  seasonTabText: {
+    color: 'rgba(255,255,255,0.6)',
+    fontSize: rs(18),
+    fontWeight: '600',
+    letterSpacing: 0.5,
+  },
+  seasonTabTextActive: {
+    color: '#fff',
+    fontWeight: '700',
+  },
+  seasonTabIndicator: {
+    position: 'absolute',
+    bottom: -2,
+    left: '20%',
+    width: '60%',
+    height: 3,
+    backgroundColor: '#ff1744',
+    borderRadius: 3,
+    shadowColor: '#ff1744',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.6,
+    shadowRadius: 6,
+  },
+});
